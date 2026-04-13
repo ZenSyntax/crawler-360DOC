@@ -497,8 +497,20 @@ def fetch_showweb_article_stream(session: requests.Session, art_url: str) -> Res
                     f"文章 429，{ARTICLE_429_RETRY_INTERVAL_SEC}s 后重试 "
                     f"url={art_url} 已试 {attempt} 次"
                 )
-            time.sleep(ARTICLE_429_RETRY_INTERVAL_SEC)
+            _lib_request_pacing_sleep()
             continue
+        if resp.status_code == 403:
+            resp.close()
+            body_preview = (resp.text or "")[:500]
+            send_alert_email(
+                f"article-showweb-http-403::{art_url}",
+                "360doc 抓取告警：触发 IP 黑名单拦截 (403)",
+                f"url={art_url}\nstatus=403\n由于触发 IP 封禁，程序已自动终止。\n\nbody_preview={body_preview!r}",
+                deduplicate=False,
+            )
+            log_error(f"检测到 403 IP 拦截，停止抓取直接退出。URL: {art_url}")
+            import sys
+            sys.exit(5)
         body_preview = (resp.text or "")[:500]
         send_alert_email(
             f"article-showweb-http-{resp.status_code}::{art_url}",
@@ -1082,6 +1094,7 @@ def run() -> None:
                 if len(artlists) < page_size:
                     break
                 page += 1
+                _lib_request_pacing_sleep()
 
         gen_word_effective = bool(args.gen_word or args.r_clean_only)
         if clean_disk or gen_word_effective:
