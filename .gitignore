@@ -1,6 +1,7 @@
 src/__pycache__
+docs
 output-space
-output-space/my-category/library_error_url.txt
-output-space/my-essay/essay_error_url.txt
-clean_error_url.txt
+logs/*
+!logs/.gitkeep
 .env
+.vscode

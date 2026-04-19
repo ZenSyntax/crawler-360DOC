@@ -1,13 +1,14 @@
-"""360doc 随笔：备份清洗 HTML，可选转 Word。依赖、环境变量与用法见仓库根 README.md「wc-essay」。"""
+"""360doc 随笔抓取入口：按分类分页备份清洗 HTML，可选转换 Word。详见 README「wc-essay」。"""
 
 from __future__ import annotations
 
 from _site_paths import ensure_this_file_in_script_dir, output_space_path
 
-ensure_this_file_in_script_dir(__file__)
+_REPO_ROOT, _ = ensure_this_file_in_script_dir(__file__)
 
 import argparse
 import hashlib
+import importlib.util
 import os
 import random
 import re
@@ -27,12 +28,7 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 # 可选依赖 lxml 作为 BS4 解析器；未安装则回退 html.parser。
-try:
-    import lxml  # noqa: F401
-
-    _BS_PARSER = "lxml"
-except ImportError:
-    _BS_PARSER = "html.parser"
+_BS_PARSER = "lxml" if importlib.util.find_spec("lxml") else "html.parser"
 from requests import Response
 
 BASE = "http://www.360doc.com"
@@ -153,8 +149,6 @@ def _essay_request_pacing_sleep() -> None:
 
 
 def _load_essay_to_word_impl():
-    import importlib.util
-
     path = Path(__file__).resolve().parent / "essay-to-word.py"
     spec = importlib.util.spec_from_file_location("_essay_to_word_impl", path)
     if spec is None or spec.loader is None:
@@ -369,7 +363,7 @@ def login(session: requests.Session, user: str, password: str) -> None:
 ESSAY_HANDLER_NEW = f"{BASE}/ajax/EssayHandler_New.ashx"
 ESSAY_HANDLER = f"{BASE}/ajax/EssayHandler.ashx"
 
-_ESSAY_ERROR_LOG: Path = Path("essay_error_url.txt")
+_ESSAY_ERROR_LOG: Path = Path("logs/essay_error_url.txt")
 
 ESSAY_CATEGORIES: tuple[tuple[int, str], ...] = (
     (2, "待分类"),
@@ -945,7 +939,9 @@ def run() -> None:
         else output_space_path("my-essay")
     )
     root.mkdir(parents=True, exist_ok=True)
-    _ESSAY_ERROR_LOG = root / "essay_error_url.txt"
+    logs_dir = _REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    _ESSAY_ERROR_LOG = logs_dir / "essay_error_url.txt"
 
     categories_to_crawl, start_page, end_page = _validate_and_resolve_crawl_scope(
         args

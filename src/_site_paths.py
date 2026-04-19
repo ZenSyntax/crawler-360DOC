@@ -1,13 +1,11 @@
-"""仓库根路径、output-space 子路径与 src 脚本目录解析（本文件位于仓库根下的 ``src/``）。
+"""路径工具：解析仓库根目录、``src/`` 脚本目录与 ``output-space/`` 子路径。
 
-Python 字节码默认写入各脚本同级的 __pycache__（多为 ``src/__pycache__``）。
-默认数据目录：仓库根 ``output-space/``（如 ``my-essay``、``my-category``），由 ``output_space_path()`` 拼接。
-约定可执行入口位于仓库根 ``src/``；``ensure_this_file_in_script_dir`` 将该目录插入 ``sys.path`` 并校验调用方路径。
-仓库根 ``.env`` 可由 python-dotenv 加载；已存在于进程环境中的变量不被覆盖。
+支持按需加载仓库根 ``.env``（若安装 python-dotenv，且不覆盖已存在环境变量）。
 """
 from __future__ import annotations
 
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 OUTPUT_SPACE_DIRNAME = "output-space"
@@ -27,6 +25,7 @@ def _load_dotenv_from_repo_once() -> None:
     load_dotenv(repo_root() / ".env")
 
 
+@lru_cache(maxsize=1)
 def repo_root() -> Path:
     start = Path(__file__).resolve().parent
     for anc in [start, *start.parents]:
@@ -43,6 +42,7 @@ def output_space_path(*parts: str) -> Path:
     return p
 
 
+@lru_cache(maxsize=1)
 def script_dir() -> Path:
     _load_dotenv_from_repo_once()
     return (repo_root() / "src").resolve()

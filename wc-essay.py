@@ -1,4 +1,4 @@
-"""从仓库根转发执行 ``src/wc-essay.py``；完整参数与行为见 README「wc-essay」。"""
+"""仓库根入口：转发执行 ``src/wc-essay.py``。参数与行为见 README「wc-essay」。"""
 from __future__ import annotations
 
 import runpy

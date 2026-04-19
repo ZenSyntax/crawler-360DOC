@@ -1,19 +1,14 @@
 """
-360doc 个人文库：登录后按分类分页抓取文章 HTML；可选清洗与 Word（library-processer）。
+360doc 文库抓取入口：按分类分页抓取 HTML，并按参数执行清洗与 Word 转换。
 
-依赖：requests、beautifulsoup4、python-docx；环境变量与随笔脚本对齐（DOC360_USER、DOC360_PASS、
-DOC360_MIN_TIME/MAX_TIME、邮件告警 DOC360_* 等，见 README）。
-
-默认输出目录：<仓库根>/output-space/my-category。CLI：-d/-f/-w/--word-only/--start-page/--end-page 与随笔一致；
--c 启用清洗（写入 clean_ 前缀 HTML 与资源目录）；--start-c/--end-c 与 --c-id/--c-name 筛选分类；
---r、--r-c 控制是否保留 raw 与清洗产物。文章 URL 使用 showweb 模板；429 重试见 ARTICLE_* 常量。
+依赖、环境变量与 CLI 参数见仓库根 README「wc-library」。
 """
 
 from __future__ import annotations
 
 from _site_paths import ensure_this_file_in_script_dir, output_space_path
 
-_REPO_ROOT, _SCRIPT_DIR = ensure_this_file_in_script_dir(__file__)
+_REPO_ROOT, _ = ensure_this_file_in_script_dir(__file__)
 
 import hashlib
 import importlib.util
@@ -146,11 +141,16 @@ _EMAIL_ADDR_RE = re.compile(
     r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
 )
 
-ERROR_URL_FILE = Path("library_error_url.txt")
+ERROR_URL_FILE = Path("logs/library_error_url.txt")
+NOT_FOUND_WARNING_FILE = Path("logs/library_not_found_warning.txt")
 
 
 # 平台疑似限流异常。
 class RateLimitError(RuntimeError):
+    pass
+
+
+class ArticleNotFoundError(RuntimeError):
     pass
 
 
@@ -342,6 +342,24 @@ def append_error_url_line(line: str) -> None:
         log_warn(f"写入错误 URL 文件失败 line={line!r} err={exc}")
 
 
+def append_not_found_warning_line(line: str) -> None:
+    try:
+        NOT_FOUND_WARNING_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with NOT_FOUND_WARNING_FILE.open("a", encoding="utf-8") as fp:
+            fp.write(f"{line}\n")
+    except Exception as exc:
+        log_warn(f"写入 not-found 警告文件失败 line={line!r} err={exc}")
+
+
+def _looks_like_not_found_body(text: str) -> bool:
+    body = (text or "").lower()
+    if not body:
+        return False
+    if re.search(r"\b404\b", body):
+        return True
+    return ("not found" in body) or ("页面不存在" in body) or ("您访问的页面不存在" in body)
+
+
 def is_rate_limited_message(message: str) -> bool:
     msg = (message or "").lower()
     return any(word in msg for word in RATE_LIMIT_KEYWORDS)
@@ -482,7 +500,15 @@ def fetch_showweb_article_stream(session: requests.Session, art_url: str) -> Res
             )
             raise
         if resp.status_code == 200:
+            if _looks_like_not_found_body(resp.text):
+                resp.close()
+                raise ArticleNotFoundError(
+                    f"article not found by body marker url={art_url}"
+                )
             return resp
+        if resp.status_code == 404:
+            resp.close()
+            raise ArticleNotFoundError(f"article not found status=404 url={art_url}")
         if resp.status_code == 429:
             resp.close()
             if attempt == ARTICLE_429_ALERT_ATTEMPT:
@@ -619,6 +645,7 @@ def fetch_categories(session: requests.Session) -> list[dict]:
                 "id": nid,
                 "name": name,
                 "safe_name": safe_name,
+                "artnum": str(item.get("artnum") or "").strip(),
                 "list_kind": kind,
                 "list_pagenum": list_pagenum,
             }
@@ -673,7 +700,7 @@ def fetch_category_page(session: requests.Session, cat: dict, curnum: int) -> di
     return data
 
 
-# 修改 1：增加 bool 返回值，True 表示已下载，False 表示被跳过
+# 返回值：True 表示已下载，False 表示跳过。
 def save_article_html(
     session: requests.Session,
     article: dict,
@@ -693,11 +720,20 @@ def save_article_html(
     file_path = category_dir / f"{art_id}-{safe_title}.html"
     if file_path.exists() and not force_html:
         log_info(f"cat={category_id} page={page_num} skip={file_path.name}")
-        # 已存在，返回 False
+        # 目标文件已存在，返回 False。
         return False
 
     art_url = showweb_article_url(art_id)
-    html_resp = fetch_showweb_article_stream(session, art_url)
+    try:
+        html_resp = fetch_showweb_article_stream(session, art_url)
+    except ArticleNotFoundError:
+        append_not_found_warning_line(
+            f"{art_id}-{safe_title}-{art_url}-not_found"
+        )
+        log_warn(
+            f"cat={category_id} page={page_num} not_found={art_id}-{safe_title}.html"
+        )
+        return False
     html_bytes = html_resp.content
 
     encoding = html_resp.encoding or "utf-8"
@@ -708,7 +744,7 @@ def save_article_html(
 
     file_path.write_text(text_content, encoding="utf-8")
     log_info(f"cat={category_id} page={page_num} saved={file_path.name}")
-    # 成功下载，返回 True
+    # 下载成功，返回 True。
     return True
 
 
@@ -742,7 +778,19 @@ def parse_args() -> argparse.Namespace:
         "--word-only",
         dest="word_only",
         action="store_true",
-        help="仅执行清洗/Word 步骤，不登录、不抓取（需输出目录已存在）。",
+        help="仅将本地 clean_*.html 转换为 Word（不登录、不抓取；缺 clean 文件则跳过）。",
+    )
+    parser.add_argument(
+        "--clean-only",
+        dest="clean_only",
+        action="store_true",
+        help="仅在本地已有 HTML 上执行清洗（不登录、不抓取）。",
+    )
+    parser.add_argument(
+        "--local-only",
+        dest="local_only",
+        action="store_true",
+        help="仅处理本地已有数据；可配合 -c/-w/--r-c 使用。",
     )
     parser.add_argument(
         "--start-page",
@@ -873,7 +921,7 @@ def _log_startup_library_config(
     args: argparse.Namespace,
     root: Path,
     *,
-    word_only: bool,
+    local_only: bool,
     pacing_lo_ms: int,
     pacing_hi_ms: int,
     pacing_src: str,
@@ -883,8 +931,13 @@ def _log_startup_library_config(
 ) -> None:
     # 打印本次运行将使用的目录、模式、频控与分页等配置。
     log_info("── 本次命令行配置（已生效）──")
-    if word_only:
-        log_info("模式: 仅清洗/Word（--word-only），不登录、不抓取")
+    if local_only:
+        if args.word_only:
+            log_info("模式: 仅本地 Word（--word-only），不登录、不抓取")
+        elif args.clean_only:
+            log_info("模式: 仅本地清洗（--clean-only），不登录、不抓取")
+        else:
+            log_info("模式: 仅本地处理（--local-only），不登录、不抓取")
     else:
         log_info("模式: 登录并抓取文库文章 HTML")
     if args.work_dir:
@@ -894,7 +947,7 @@ def _log_startup_library_config(
     log_info(
         f"请求频控: 每篇文章间隔随机等待 {pacing_lo_ms}–{pacing_hi_ms} ms（{pacing_src}）"
     )
-    if not word_only:
+    if not local_only:
         log_info(
             f"分类范围: 按「{'名称（--c-name）' if args.c_by_name else 'id（默认 / --c-id）'}」解析 --start-c / --end-c"
         )
@@ -903,19 +956,56 @@ def _log_startup_library_config(
         log_info(f"列表页码: {rng}")
     log_info(f"数据清洗 (-c): {'是' if args.do_clean else '否'}")
     log_info(f"Word (-w/--r-c): {'是' if (args.gen_word or args.r_clean_only) else '否'}")
+    log_info(f"仅本地 Word (--word-only): {'是' if args.word_only else '否'}")
+    log_info(f"仅本地清洗 (--clean-only): {'是' if args.clean_only else '否'}")
+    log_info(f"本地模式总开关 (--local-only): {'是' if args.local_only else '否'}")
     log_info(f"强制覆盖 (-f): {'是' if args.force else '否'}")
     log_info(f"删除原 HTML (--r): {'是' if args.remove_original else '否'}")
     log_info(f"仅保留 Word (--r-c): {'是' if args.r_clean_only else '否'}")
     log_info("── 以上配置确认后开始执行 ──")
 
 
+def _is_processer_rate_limit_error(exc: Exception) -> bool:
+    return exc.__class__.__name__ in {
+        "CleanRateLimitError",
+        "CleanBlacklistError",
+        "RateLimitError",
+    }
+
+
+def _is_blacklist_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return "status=403" in msg and "blacklist" in msg
+
+
+def _send_clean_blacklist_alert(exc: Exception) -> None:
+    send_alert_email(
+        "clean-resource-http-403-blacklist",
+        "360doc 抓取告警：清洗阶段触发 IP 黑名单拦截 (403)",
+        (
+            "stage=clean-resource\n"
+            "status=403\n"
+            "reason=ip-blacklist\n"
+            f"exception={exc}"
+        ),
+        deduplicate=False,
+    )
+
+
 def run() -> None:
     global ERROR_URL_FILE
+    global NOT_FOUND_WARNING_FILE
     global _LIB_PACING_SEC
 
     args = parse_args()
+    if args.word_only:
+        args.gen_word = True
+        args.do_clean = False
+    if args.clean_only:
+        args.do_clean = True
     if args.r_clean_only:
         args.gen_word = True
+    local_only_mode = bool(args.local_only or args.word_only or args.clean_only)
 
     clean_disk = bool(args.do_clean and not args.r_clean_only)
     root = (
@@ -924,26 +1014,34 @@ def run() -> None:
         else output_space_path("my-category")
     )
     root.mkdir(parents=True, exist_ok=True)
-    ERROR_URL_FILE = root / "library_error_url.txt"
+    logs_dir = _REPO_ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    ERROR_URL_FILE = logs_dir / "library_error_url.txt"
+    NOT_FOUND_WARNING_FILE = logs_dir / "library_not_found_warning.txt"
 
     pacing_lo_ms, pacing_hi_ms, pacing_src = resolve_request_pacing_ms()
     _LIB_PACING_SEC = (pacing_lo_ms / 1000.0, pacing_hi_ms / 1000.0)
 
     proc = _load_library_processer()
     proc.set_processer_loggers(log_info, log_warn)
-    proc.set_clean_error_url_file(_REPO_ROOT / "clean_error_url.txt")
+    proc.set_clean_error_url_file(logs_dir / "clean_error_url.txt")
+    proc.set_clean_article_error_file(logs_dir / "clean_article_error.txt")
+    proc.set_resources_not_found_warning_file(
+        logs_dir / "resources_not_found_warning.txt"
+    )
+    proc.set_category_artnum_map({})
 
-    if args.word_only:
+    if local_only_mode:
         if not root.is_dir():
             log_error(f"目录不存在: {root}")
             sys.exit(1)
         if not clean_disk and not args.gen_word and not args.r_clean_only:
-            log_error("word-only 模式下需同时使用 -c、-w 或 --r-c 之一。")
+            log_error("local-only 模式下需启用清洗或 Word（-c/-w/--r-c/--clean-only/--word-only）。")
             sys.exit(1)
         _log_startup_library_config(
             args,
             root,
-            word_only=True,
+            local_only=True,
             pacing_lo_ms=pacing_lo_ms,
             pacing_hi_ms=pacing_hi_ms,
             pacing_src=pacing_src,
@@ -960,17 +1058,55 @@ def run() -> None:
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
-        nf = proc.run_clean_and_word_pass(
-            root,
-            session,
-            enable_clean=clean_disk,
-            gen_word=bool(args.gen_word or args.r_clean_only),
-            force_clean=args.force,
-            force_docx=args.force,
-            remove_original=args.remove_original,
-            r_clean_only=args.r_clean_only,
-            remove_raw_when_word_only=args.remove_original and not clean_disk,
-        )
+        # 仅在会触发资源请求的本地流程中尝试自动登录，纯本地 word-only 不登录。
+        local_pipeline_needs_network = bool(clean_disk or args.r_clean_only)
+        user = os.environ.get("DOC360_USER", "").strip()
+        password = os.environ.get("DOC360_PASS", "")
+        if local_pipeline_needs_network and user and password:
+            try:
+                session.headers.update(HEADERS)
+                login(session, user, password)
+                prime_browser_context(session)
+                log_info(
+                    "本地模式不使用 session cookie: session cookie 将被用于加载有更严格限制的资源加载"
+                )
+            except Exception as exc:
+                log_warn(f"local mode auto-login failed (continue without login): {exc}")
+        try:
+            nf = proc.run_clean_and_word_pass(
+                root,
+                session,
+                enable_clean=clean_disk,
+                gen_word=bool(args.gen_word or args.r_clean_only),
+                force_clean=args.force,
+                force_docx=args.force,
+                remove_original=args.remove_original,
+                r_clean_only=args.r_clean_only,
+                remove_raw_when_word_only=args.remove_original and not clean_disk,
+                clean_article_pacing_sec=_LIB_PACING_SEC,
+            )
+            if clean_disk:
+                replay_stats = proc.replay_resource_failures_from_logs(root, session)
+                if replay_stats.get("entries_total", 0) > 0:
+                    log_info(
+                        "log replay reclean: "
+                        f"entries={replay_stats.get('entries_total', 0)} "
+                        f"recoverable={replay_stats.get('entries_recoverable', 0)} "
+                        f"recleaned_articles={replay_stats.get('articles_recleaned', 0)} "
+                        f"removed_lines={replay_stats.get('lines_removed', 0)}"
+                    )
+        except KeyboardInterrupt:
+            log_warn("收到键盘中断（KeyboardInterrupt），退出。")
+            sys.exit(130)
+        except Exception as exc:
+            if _is_processer_rate_limit_error(exc):
+                if _is_blacklist_rate_limit_error(exc):
+                    _send_clean_blacklist_alert(exc)
+                    log_error(f"检测到清洗 403 IP 黑名单拦截，程序退出: {exc}")
+                    sys.exit(5)
+                log_error(f"清洗阶段触发熔断，程序退出: {exc}")
+                sys.exit(3)
+            raise
         sys.exit(0 if nf == 0 else 1)
 
     start_page = 1 if args.start_page is None else args.start_page
@@ -1009,6 +1145,13 @@ def run() -> None:
 
     try:
         all_categories = fetch_categories(session)
+        proc.set_category_artnum_map(
+            {
+                str(abs(int(c.get("id", 0)))): str(c.get("artnum") or "").strip()
+                for c in all_categories
+                if str(c.get("artnum") or "").strip()
+            }
+        )
         selected_categories = resolve_selected_categories(all_categories, args)
         if not selected_categories:
             log_warn("筛选后无可处理分类；核对 --start-c / --end-c 与 --c-id / --c-name。")
@@ -1017,7 +1160,7 @@ def run() -> None:
         _log_startup_library_config(
             args,
             root,
-            word_only=False,
+            local_only=False,
             pacing_lo_ms=pacing_lo_ms,
             pacing_hi_ms=pacing_hi_ms,
             pacing_src=pacing_src,
@@ -1098,20 +1241,40 @@ def run() -> None:
 
         gen_word_effective = bool(args.gen_word or args.r_clean_only)
         if clean_disk or gen_word_effective:
-            proc.run_clean_and_word_pass(
-                root,
-                session,
-                enable_clean=clean_disk,
-                gen_word=gen_word_effective,
-                force_clean=args.force,
-                force_docx=args.force,
-                remove_original=args.remove_original,
-                r_clean_only=args.r_clean_only,
-                remove_raw_when_word_only=args.remove_original and not clean_disk,
-            )
+            try:
+                proc.run_clean_and_word_pass(
+                    root,
+                    session,
+                    enable_clean=clean_disk,
+                    gen_word=gen_word_effective,
+                    force_clean=args.force,
+                    force_docx=args.force,
+                    remove_original=args.remove_original,
+                    r_clean_only=args.r_clean_only,
+                    remove_raw_when_word_only=args.remove_original and not clean_disk,
+                    clean_article_pacing_sec=_LIB_PACING_SEC,
+                )
+                if clean_disk:
+                    replay_stats = proc.replay_resource_failures_from_logs(root, session)
+                    if replay_stats.get("entries_total", 0) > 0:
+                        log_info(
+                            "log replay reclean: "
+                            f"entries={replay_stats.get('entries_total', 0)} "
+                            f"recoverable={replay_stats.get('entries_recoverable', 0)} "
+                            f"recleaned_articles={replay_stats.get('articles_recleaned', 0)} "
+                            f"removed_lines={replay_stats.get('lines_removed', 0)}"
+                        )
+            except Exception as exc:
+                if _is_processer_rate_limit_error(exc):
+                    raise RateLimitError(f"清洗阶段触发熔断: {exc}") from exc
+                raise
     except KeyboardInterrupt:
         log_warn("收到键盘中断（KeyboardInterrupt），退出。")
     except RateLimitError as exc:
+        if _is_blacklist_rate_limit_error(exc):
+            _send_clean_blacklist_alert(exc)
+            log_error(f"检测到清洗 403 IP 黑名单拦截，程序退出: {exc}")
+            sys.exit(5)
         send_alert_email(
             "rate-limit",
             "360doc 抓取告警：疑似限流",

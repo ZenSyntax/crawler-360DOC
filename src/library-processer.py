@@ -1,61 +1,89 @@
-"""
-文库 HTML 清洗与 Word（.docx）转换。由 wc-library 加载；入口为仓库根或 src 下的 wc-library.py。
+﻿"""
+Library cleaner module: transforms raw HTML into clean_ HTML and optional Word (.docx).
 
-清洗产物：clean_<原名>.html；结构为 article 卡片 + 标题区 / 元信息 / 正文 #content（不再保留 #artContent 外壳）。
-资源目录与清洗 HTML 主文件名相同（无 .html 后缀）。
+Loaded by wc-library; entry scripts are wc-library.py under repo root or src/.
+Resource directory and clean_ HTML main file share the same stem (without .html).
 """
 
 from __future__ import annotations
 
 import copy
+import concurrent.futures
+import hashlib
+import io
+import json
 import os
 import random
 import re
 import shutil
-import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_UNDERLINE
+from docx.image.exceptions import UnrecognizedImageError
 from docx.text.paragraph import Paragraph
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import nsdecls, qn
 from docx.oxml.parser import parse_xml
 from docx.shared import Inches, Pt, RGBColor
+from PIL import Image
 
 BASE_URL = "http://www.360doc.com"
+IMG_CHANGE_URL = f"{BASE_URL}/Ajax/imgurl.ashx?op=changeurl"
 ALLOWED_HOSTS = ("360doc.com", "360doc.cn")
 TIMEOUT = 20
 MAX_RETRY = 2
+RESOURCE_REQUEST_TIMEOUT = 8
+RESOURCE_REQUEST_RETRIES = 1
 RESOURCE_REQUEST_SLEEP_SEC = (0.2, 0.55)
 AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC = (0.35, 0.9)
+RESOURCE_START_JITTER_SEC = (0.01, 0.08)
+# 资源并发线程上限：按资源数动态创建线程，每个线程尽量只处理一个资源。
+def _get_env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except Exception:
+        return default
+    return val if val > 0 else default
+
+
+RESOURCE_DOWNLOAD_MAX_WORKERS = _get_env_positive_int("DOC360_MAX_WORKERS", 50)
+RESOURCE_MAX_ATTEMPTS_PER_URL = 12
+RESOURCE_MAX_REFRESH_RETRIES = 4
+RESOURCE_PROGRESS_HEARTBEAT_SEC = 8
 INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 WORD_META_WORDURL_RE = re.compile(r"wordurl\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 WORD_META_PAGENUM_RE = re.compile(r"pageNume\s*=\s*(\d+)", re.I)
+PPT_IMG_ARR_RE = re.compile(r"var\s+pptimgArr\s*=\s*\[(.*?)\]\s*;?", re.I | re.S)
+PPT_IMG_URL_RE = re.compile(r"['\"]([^'\"]+)['\"]")
 WORD_PREVIEW_PAGE_SLEEP_SEC = (0.25, 0.65)
 MAX_WORD_PREVIEW_PAGES = 200
 
-# clean_ 前缀：清洗结果 HTML；扫描时排除，与 raw 区分
+# clean_ prefix marks cleaned HTML and differentiates it from raw files during scans.
 CLEAN_HTML_PREFIX = "clean_"
 
-# 小三号 ≈ 15pt；五号 ≈ 10.5pt
+# Font-size mapping: title ~15pt, metadata/body ~10.5pt.
 TITLE_PT = Pt(15)
 META_PT = Pt(10.5)
 DEFAULT_BODY_PT = Pt(10.5)
-# 正文与标题区统一：固定行距 20 磅，段前段后 0
+# Unified spacing: fixed 20pt line spacing, zero paragraph spacing.
 FIXED_LINE_SPACING_PT = Pt(20)
 
-# 本地图片扩展名（src/href 判定与缺失 src 时的补全）
+# Local image suffixes used for src/href checks and src fallback.
 _LOCAL_IMAGE_HREF_EXTS = (
     ".jpg",
     ".jpeg",
@@ -64,13 +92,40 @@ _LOCAL_IMAGE_HREF_EXTS = (
     ".webp",
     ".bmp",
 )
-# 抓取正文根节点若为下列 id，清洗时展开子节点，避免多包一层 div
+# Expand wrapper roots during cleaning to avoid adding an extra container div.
 _CONTENT_WRAPPER_IDS = frozenset({"artContent", "printArticle"})
 
-CLEAN_ERROR_URL_FILE = Path("clean_error_url.txt")
+CLEAN_ERROR_URL_FILE = Path("logs/clean_error_url.txt")
+CLEAN_ARTICLE_ERROR_FILE = Path("logs/clean_article_error.txt")
+RESOURCES_NOT_FOUND_WARNING_FILE = Path("logs/resources_not_found_warning.txt")
+RATE_LIMIT_STATUS_CODES = {403}
+TRANSIENT_GATEWAY_STATUS_CODES = {502, 503, 504}
+TRANSIENT_GATEWAY_RETRY_SLEEP_SEC = (0.6, 1.6)
+_CATEGORY_ARTNUM_BY_DIR_ID: dict[str, str] = {}
 
 _log_info = print
 _log_warn = print
+
+
+class CleanRateLimitError(RuntimeError):
+    pass
+
+
+class ResourceNotFoundError(RuntimeError):
+    pass
+
+
+class ResourceExpiredError(RuntimeError):
+    pass
+
+
+class ResourceGatewayError(RuntimeError):
+    pass
+
+
+class ResourceLocalizationResult(NamedTuple):
+    downloaded: int
+    failed_urls: list[str]
 
 
 def set_processer_loggers(log_info_fn, log_warn_fn) -> None:
@@ -82,6 +137,25 @@ def set_processer_loggers(log_info_fn, log_warn_fn) -> None:
 def set_clean_error_url_file(path: Path) -> None:
     global CLEAN_ERROR_URL_FILE
     CLEAN_ERROR_URL_FILE = path
+
+
+def set_clean_article_error_file(path: Path) -> None:
+    global CLEAN_ARTICLE_ERROR_FILE
+    CLEAN_ARTICLE_ERROR_FILE = path
+
+
+def set_resources_not_found_warning_file(path: Path) -> None:
+    global RESOURCES_NOT_FOUND_WARNING_FILE
+    RESOURCES_NOT_FOUND_WARNING_FILE = path
+
+
+def set_category_artnum_map(mapping: dict[str, str]) -> None:
+    global _CATEGORY_ARTNUM_BY_DIR_ID
+    _CATEGORY_ARTNUM_BY_DIR_ID = {
+        str(k).strip(): str(v).strip()
+        for k, v in (mapping or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
 
 
 def log_info(msg: str) -> None:
@@ -101,20 +175,97 @@ def append_clean_error_url_line(line: str) -> None:
         log_warn(f"写入 clean_error_url.txt 失败 line={line!r} err={exc}")
 
 
+def append_clean_article_error_line(line: str) -> None:
+    try:
+        CLEAN_ARTICLE_ERROR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with CLEAN_ARTICLE_ERROR_FILE.open("a", encoding="utf-8") as fp:
+            fp.write(f"{line}\n")
+    except Exception as exc:
+        log_warn(f"写入 clean_article_error.txt 失败 line={line!r} err={exc}")
+
+
+def append_clean_resource_failure_line(
+    *,
+    article_id: str,
+    article_title: str,
+    article_dir_name: str,
+    resource_url: str,
+    error: Exception,
+) -> None:
+    # 兼容旧日志前缀：article_id-url-exc；追加 article/dir 便于定位。
+    legacy = f"{article_id}-{resource_url}-{error}"
+    append_clean_error_url_line(
+        f"{legacy}\tarticle={article_title or 'unknown'}\tdir={article_dir_name or 'unknown'}"
+    )
+
+
+def append_resource_not_found_warning_line(line: str) -> None:
+    try:
+        RESOURCES_NOT_FOUND_WARNING_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with RESOURCES_NOT_FOUND_WARNING_FILE.open("a", encoding="utf-8") as fp:
+            fp.write(f"{line}\n")
+    except Exception as exc:
+        log_warn(
+            f"写入 resources_not_found_warning.txt 失败 line={line!r} err={exc}"
+        )
+
+
+def _looks_like_not_found_body(text: str) -> bool:
+    body = (text or "").lower()
+    if not body:
+        return False
+    if re.search(r"\b404\b", body):
+        return True
+    return "not found" in body
+
+
+def _is_textual_content_type(content_type: str) -> bool:
+    ct = (content_type or "").lower()
+    if not ct:
+        return False
+    return (
+        ct.startswith("text/")
+        or "json" in ct
+        or "xml" in ct
+        or "javascript" in ct
+        or "x-www-form-urlencoded" in ct
+    )
+
+
+def _looks_like_expired_signature_body(text: str) -> bool:
+    body = (text or "").lower()
+    if not body:
+        return False
+    return (
+        ("request has expired" in body)
+        or ("<code>accessdenied</code>" in body and "expires" in body)
+    )
+
+
+def _category_dir_id_from_name(article_dir_name: str) -> str:
+    m = re.match(r"^(-?\d+)-", (article_dir_name or "").strip())
+    if not m:
+        return ""
+    raw = m.group(1)
+    if raw.startswith("-"):
+        raw = raw[1:]
+    return raw
+
+
+def _domain_hint_from_article_dir(article_dir_name: str) -> str:
+    did = _category_dir_id_from_name(article_dir_name)
+    if not did:
+        return ""
+    return _CATEGORY_ARTNUM_BY_DIR_ID.get(did, "")
+
+
 def sanitize_name(name: str, fallback: str) -> str:
     name = INVALID_NAME_RE.sub("_", name).strip().rstrip(".")
     return name or fallback
 
 
-def should_skip_html(path: Path) -> bool:
-    n = path.name.lower()
-    if not n.endswith(".html"):
-        return False
-    return n.startswith(CLEAN_HTML_PREFIX.lower())
-
-
 def _is_html_inside_clean_resource_subdir(path: Path) -> bool:
-    # 位于 clean_<stem>/ 资源目录内的 .html 为下载碎片，不参与文库文章扫描。
+    # HTML files under clean_<stem>/ are resource fragments and are excluded from article scans.
     for parent in path.parents:
         pn = parent.name
         if pn.startswith(CLEAN_HTML_PREFIX) and not pn.lower().endswith(".html"):
@@ -123,8 +274,8 @@ def _is_html_inside_clean_resource_subdir(path: Path) -> bool:
 
 
 def iter_library_article_html_files(root: Path) -> list[Path]:
-    # 待处理的文库文章 HTML：数字 id 开头的 raw，或「仅有 clean_、无同名 raw」的孤儿清洗文件。
-    # 排除 clean_* 资源子目录内的页面（如 res_2.html）。
+    # Candidate article files: id-prefixed raw HTML, or orphan clean_ files without matching raw files.
+    # Exclude HTML fragments inside clean_* resource subdirectories (for example res_2.html).
     out: list[Path] = []
     pfx = CLEAN_HTML_PREFIX
     lpfx = pfx.lower()
@@ -167,19 +318,61 @@ def is_localizable_url(url: str) -> bool:
 
 
 def request_with_retry(
-    session: requests.Session, url: str, headers: dict | None = None
+    session: requests.Session,
+    url: str,
+    headers: dict | None = None,
+    *,
+    timeout: int = TIMEOUT,
+    retries: int = MAX_RETRY,
+    use_session_cookies: bool = True,
+    bypass_env_proxy: bool = False,
 ) -> requests.Response:
     last_exc: Exception | None = None
-    for _ in range(MAX_RETRY + 1):
+    for attempt in range(1, retries + 2):
         try:
-            resp = session.get(url, timeout=TIMEOUT, headers=headers)
+            req_kwargs: dict = {"timeout": timeout, "headers": headers}
+            if bypass_env_proxy:
+                # 某些环境变量代理会把 360doc 资源图链放大成 502，资源下载时可按需直连。
+                req_kwargs["proxies"] = {"http": None, "https": None}
+            if use_session_cookies:
+                resp = session.get(url, **req_kwargs)
+            else:
+                # 资源直链尽量不带 Cookie，贴近浏览器跨域图片请求。
+                resp = requests.get(url, **req_kwargs)
+            if resp.status_code == 403 and _looks_like_expired_signature_body(resp.text):
+                raise ResourceExpiredError(f"resource signature expired url={url}")
+            resp_ct = resp.headers.get("content-type", "")
+            if resp.status_code == 404 or (
+                resp.status_code < 500
+                and _is_textual_content_type(resp_ct)
+                and _looks_like_not_found_body(resp.text)
+            ):
+                raise ResourceNotFoundError(f"resource not found url={url}")
+            if resp.status_code in TRANSIENT_GATEWAY_STATUS_CODES:
+                if _looks_like_expired_signature_body(resp.text):
+                    raise ResourceExpiredError(f"resource signature expired url={url}")
+                raise ResourceGatewayError(
+                    f"{resp.status_code} Server Error: Bad Gateway for url: {url}"
+                )
             resp.raise_for_status()
             return resp
         except Exception as exc:
+            if isinstance(exc, ResourceGatewayError):
+                last_exc = exc
+                if attempt < (retries + 1):
+                    time.sleep(random.uniform(*TRANSIENT_GATEWAY_RETRY_SLEEP_SEC))
+                    continue
+                break
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                status = exc.response.status_code
+                if status in RATE_LIMIT_STATUS_CODES:
+                    preview = (exc.response.text or "")[:300]
+                    raise CleanRateLimitError(
+                        f"clean resource request blocked url={url} status={status} body={preview!r}"
+                    ) from exc
             last_exc = exc
     assert last_exc is not None
     raise last_exc
-
 
 def extract_article_meta(soup: BeautifulSoup) -> tuple[str, str, str]:
     title = ""
@@ -236,6 +429,8 @@ def fetch_word_preview_body(
     page_count: int,
     source_url: str,
     article_id: str,
+    article_title: str,
+    article_dir_name: str,
 ) -> Tag | None:
     wrapper_soup = BeautifulSoup(
         '<div class="word-document-preview"></div>', "html.parser"
@@ -269,9 +464,23 @@ def fetch_word_preview_body(
             if page_div.get_text(strip=True) or page_div.find(["img", "a", "table"]):
                 any_page_ok = True
             wrapper.append(page_div)
+        except CleanRateLimitError:
+            raise
+        except ResourceNotFoundError:
+            append_resource_not_found_warning_line(
+                f"article_id={article_id}\tarticle={article_title}\tdir={article_dir_name}"
+                f"\tresource={page_url}\tnot_found=1"
+            )
+            wrapper.append(page_div)
         except Exception as exc:
             log_warn(f"Word 预览页拉取失败 art={article_id} url={page_url} err={exc}")
-            append_clean_error_url_line(f"{article_id}-{page_url}-{exc}")
+            append_clean_resource_failure_line(
+                article_id=article_id,
+                article_title=article_title,
+                article_dir_name=article_dir_name,
+                resource_url=page_url,
+                error=exc,
+            )
             wrapper.append(page_div)
         time.sleep(random.uniform(*WORD_PREVIEW_PAGE_SLEEP_SEC))
 
@@ -280,8 +489,90 @@ def fetch_word_preview_body(
     return wrapper
 
 
+def parse_ppt_image_urls(raw_html: str, source_url: str) -> list[str]:
+    m = PPT_IMG_ARR_RE.search(raw_html or "")
+    if not m:
+        return []
+    block = m.group(1) or ""
+    out: list[str] = []
+    seen: set[str] = set()
+    for um in PPT_IMG_URL_RE.finditer(block):
+        raw = (um.group(1) or "").strip()
+        if not raw:
+            continue
+        abs_url = normalize_url(raw, source_url)
+        if not is_localizable_url(abs_url):
+            continue
+        abs_url = _prefer_working_360doc_image_host(abs_url)
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        out.append(abs_url)
+    return out
+
+
+def build_ppt_preview_body(ppt_urls: list[str]) -> Tag | None:
+    if not ppt_urls:
+        return None
+    wrapper_soup = BeautifulSoup(
+        '<div class="ppt-document-preview"></div>', "html.parser"
+    )
+    wrapper = wrapper_soup.div
+    if wrapper is None:
+        return None
+    for idx, u in enumerate(ppt_urls, start=1):
+        page_div = wrapper_soup.new_tag(
+            "div", attrs={"class": "ppt-preview-page", "data-page": str(idx)}
+        )
+        img = wrapper_soup.new_tag(
+            "img",
+            attrs={"src": u, "alt": f"ppt-page-{idx}", "data-ppt-page": str(idx)},
+        )
+        page_div.append(img)
+        wrapper.append(page_div)
+    return wrapper
+
+
+def resolve_content_node(
+    *,
+    soup: BeautifulSoup,
+    raw_html: str,
+    session: requests.Session,
+    source_url: str,
+    article_id: str,
+    article_title: str,
+    article_dir_name: str,
+) -> Tag | None:
+    content = extract_body_tag_standard(soup)
+    if content is not None:
+        return content
+    word_meta = parse_word_document_meta(raw_html)
+    if word_meta:
+        word_base, page_count = word_meta
+        log_info(
+            f"Word 预览正文 art={article_id} pages={page_count} base={word_base}"
+        )
+        content = fetch_word_preview_body(
+            session,
+            word_base,
+            page_count,
+            source_url,
+            article_id,
+            article_title,
+            article_dir_name,
+        )
+        if content is not None:
+            return content
+    ppt_urls = parse_ppt_image_urls(raw_html, source_url)
+    ppt_content = build_ppt_preview_body(ppt_urls)
+    if ppt_content is not None:
+        log_info(f"PPT 预览正文 art={article_id} pages={len(ppt_urls)}")
+        return ppt_content
+    return None
+
+
 def build_clean_soup(title: str, author: str, publish_date: str, content_node: Tag) -> BeautifulSoup:
-    # 清洗页 DOM：article 卡片 → 标题区 / 元信息 / 正文 #content（共 4 块），正文内不再保留 artContent 外壳。
+    # Build cleaned DOM: article card with title, metadata, and #content body; omit #artContent shell.
     clean_html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -337,12 +628,13 @@ def build_clean_soup(title: str, author: str, publish_date: str, content_node: T
 
 
 _IMG_PLACEHOLDER_SRC_RE = re.compile(
-    r"(?:space|blank|spacer|transparent|1x1)\.(?:gif|png)|pixel\.gif$", re.I
+    r"(?:space|blank|spacer|transparent|1x1|default|loading)\.(?:gif|png)|pixel\.gif$",
+    re.I,
 )
 
 
 def _prefer_working_360doc_image_host(url: str) -> str:
-    # 360doc 存图：data360-src 常为 checki*.360doc.com，直链 GET 会跳 gohost 404；image*. 同路径可下。
+    # data360-src often points to checki* hosts; rewrite to image* variant to avoid gohost 404 hops.
     if not url:
         return url
     try:
@@ -365,8 +657,220 @@ def _prefer_working_360doc_image_host(url: str) -> str:
     return url
 
 
+def _strip_url_query(url: str) -> str:
+    if not url:
+        return url
+    try:
+        p = urlparse(url)
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, "", ""))
+    except Exception:
+        return url
+
+
+def _https_variant(url: str) -> str:
+    uu = (url or "").strip()
+    if not uu.startswith("http://"):
+        return ""
+    try:
+        h = (urlparse(uu).netloc or "").lower()
+        # 这类 360doc 老 CDN 节点经常 HTTPS EOF，避免优先走 https。
+        if h.endswith(".360doc.com") and (
+            h.startswith("imgu")
+            or h.startswith("imgi")
+            or h.startswith("checku")
+            or h.startswith("checki")
+        ):
+            return ""
+    except Exception:
+        pass
+    return "https://" + uu[7:]
+
+
+def _prefer_legacy_360doc_http(url: str) -> str:
+    uu = (url or "").strip()
+    if not uu:
+        return uu
+    try:
+        p = urlparse(uu)
+        h = (p.netloc or "").lower()
+        if p.scheme == "https" and h.endswith(".360doc.com") and (
+            h.startswith("imgu")
+            or h.startswith("imgi")
+            or h.startswith("checku")
+            or h.startswith("checki")
+        ):
+            return urlunparse(("http", p.netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return uu
+    return uu
+    return ""
+
+
+def _url_path_key(url: str) -> str:
+    try:
+        return urlparse(url).path or ""
+    except Exception:
+        return ""
+
+
+def _rewrite_url_host(url: str, new_host: str) -> str:
+    try:
+        p = urlparse(url)
+        return urlunparse((p.scheme, new_host, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return url
+
+
+def _legacy_360doc_host_family(host: str) -> list[str]:
+    h = (host or "").lower().strip()
+    if not h.endswith(".360doc.com"):
+        return []
+    m = re.match(r"^(check|img)([ui])([0-9a-z]+)\.360doc\.com$", h)
+    if not m:
+        return [h]
+    _, _, tail = m.groups()
+    out = [
+        f"checku{tail}.360doc.com",
+        f"checki{tail}.360doc.com",
+        f"imgu{tail}.360doc.com",
+        f"imgi{tail}.360doc.com",
+    ]
+    uniq: list[str] = []
+    for x in out:
+        if x not in uniq:
+            uniq.append(x)
+    return uniq
+
+
+def _build_article_signed_src_candidates(
+    session: requests.Session, source_url: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    # 从源文章页提取 data360-src -> src 的动态映射（src 常带 Expires/Signature/domain）。
+    full_map: dict[str, str] = {}
+    path_map: dict[str, str] = {}
+    try:
+        resp = session.get(
+            source_url,
+            timeout=TIMEOUT,
+            headers={
+                "Referer": BASE_URL + "/",
+                "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
+            },
+        )
+        if resp.status_code != 200:
+            return full_map, path_map
+        soup = BeautifulSoup(resp.text or "", "html.parser")
+        for img in soup.find_all("img"):
+            if not isinstance(img, Tag):
+                continue
+            raw_src = str(img.get("src", "")).strip()
+            if not raw_src or raw_src.startswith("data:"):
+                continue
+            src_abs = normalize_url(raw_src, source_url)
+            if not is_localizable_url(src_abs):
+                continue
+            src_abs = _prefer_working_360doc_image_host(src_abs)
+            for key_attr in ("doc360img-src", "data360-src", "data-src", "data-original"):
+                raw_key = str(img.get(key_attr, "")).strip()
+                if not raw_key:
+                    continue
+                key_abs = _prefer_working_360doc_image_host(
+                    normalize_url(raw_key, source_url)
+                )
+                if not key_abs:
+                    continue
+                full_map[key_abs] = src_abs
+                kpath = _url_path_key(key_abs)
+                if kpath:
+                    path_map[kpath] = src_abs
+    except Exception:
+        return full_map, path_map
+    return full_map, path_map
+
+
+def _img_change_sign(params: dict[str, str]) -> str:
+    parts: list[str] = []
+    for k, v in params.items():
+        sv = str(v)
+        if sv == "":
+            continue
+        parts.append(f"{k}={sv}")
+    parts.sort()
+    s = "".join(parts)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest().upper()
+
+
+def _request_changeurl_signed_images(
+    session: requests.Session, source_url: str, raw_img_urls: list[str]
+) -> tuple[dict[str, str], dict[str, str]]:
+    urls = [(u or "").strip() for u in raw_img_urls if (u or "").strip()]
+    if not urls:
+        return {}, {}
+    imgurl = ",".join(urls)
+    payload = {"op": "changeurl", "imgurl": imgurl}
+    sign = _img_change_sign(payload)
+    try:
+        resp = session.post(
+            f"{IMG_CHANGE_URL}&_={int(time.time() * 1000)}",
+            data={"imgurl": imgurl, "sign": sign},
+            timeout=TIMEOUT,
+            headers={
+                "Referer": source_url,
+                "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+    except Exception:
+        return {}, {}
+    if resp.status_code != 200:
+        return {}, {}
+    txt = (resp.text or "").strip()
+    if not txt:
+        return {}, {}
+
+    try:
+        data = json.loads(txt)
+    except Exception:
+        return {}, {}
+    if str(data.get("status", "")).strip() != "1":
+        return {}, {}
+    raw_encoded = str(data.get("imgurl", "") or "").strip()
+    if not raw_encoded:
+        return {}, {}
+
+    # 样本里是 URL 编码后的逗号串，单次解码后可按逗号切分。
+    decoded = unquote(raw_encoded).replace("\\/", "/")
+    out_list = [(u or "").strip() for u in decoded.split(",") if (u or "").strip()]
+
+    by_input: dict[str, str] = {}
+    by_path: dict[str, str] = {}
+    now_ts = int(time.time())
+    for idx, su in enumerate(out_list):
+        abs_su = _prefer_working_360doc_image_host(normalize_url(su, source_url))
+        if not is_localizable_url(abs_su):
+            continue
+        try:
+            q = dict(parse_qsl(urlparse(abs_su).query, keep_blank_values=True))
+            exp_raw = str(q.get("Expires", "")).strip()
+            if exp_raw.isdigit() and int(exp_raw) <= now_ts + 15:
+                # 已过期或即将过期的签名直接丢弃，避免“拿到即失效”。
+                continue
+        except Exception:
+            pass
+        if idx < len(urls):
+            by_input[urls[idx]] = abs_su
+        p = _url_path_key(abs_su)
+        if p:
+            by_path[p] = abs_su
+    return by_input, by_path
+
+
 def _img_delegated_to_parent_download_anchor(img: Tag) -> bool:
-    # 父级 <a href> 已为 360doc 正文图链（image* + DownloadImg）时跳过 img 节点，避免 data360-src（checki*）重复请求失败。
+    # If parent <a href> is already a 360doc image link, skip the nested <img> to avoid duplicate fetches.
+    for attr in ("doc360img-src", "data360-src", "data-src", "data-original"):
+        raw_attr = str(img.get(attr, "")).strip()
+        if raw_attr and not raw_attr.startswith("data:"):
+            return False
     p = img.parent
     if not isinstance(p, Tag) or (p.name or "").lower() != "a":
         return False
@@ -377,9 +881,24 @@ def _img_delegated_to_parent_download_anchor(img: Tag) -> bool:
     return "360doc.com" in hlow and "downloadimg" in hlow
 
 
+def _anchor_wraps_360doc_download_img(anchor: Tag) -> bool:
+    if (anchor.name or "").lower() != "a":
+        return False
+    href = str(anchor.get("href", "")).strip()
+    if not href:
+        return False
+    hlow = href.lower()
+    if "360doc.com" not in hlow or "downloadimg" not in hlow:
+        return False
+    for img in anchor.find_all("img", recursive=True):
+        if isinstance(img, Tag):
+            return True
+    return False
+
+
 def _img_download_attr_name(tag: Tag) -> str | None:
-    # 优先可用 src，再懒加载属性；data360-src 放后（常与 href 域名不一致）。
-    for attr in ("src", "data-src", "data-original", "data360-src"):
+    # Download attribute priority: explicit 360doc image attributes first, then src.
+    for attr in ("doc360img-src", "data360-src", "data-src", "data-original", "src"):
         raw = str(tag.get(attr, "")).strip()
         if not raw or raw.startswith("data:"):
             continue
@@ -390,7 +909,7 @@ def _img_download_attr_name(tag: Tag) -> str | None:
 
 
 def collect_resource_nodes(soup: BeautifulSoup) -> list[tuple[Tag, str, str]]:
-    # (tag, 读取远程 URL 的属性名, 写入本地化相对路径的属性名)。img 统一写入 src 以便浏览器与 Word 加载。
+    # Return tuples: (tag, remote-url-attr, localized-path-attr). img always writes localized path to src.
     nodes: list[tuple[Tag, str, str]] = []
     root = soup.select_one("#content")
     if root is None:
@@ -400,6 +919,8 @@ def collect_resource_nodes(soup: BeautifulSoup) -> list[tuple[Tag, str, str]]:
             continue
         name = (tag.name or "").lower()
         if name == "a" and tag.has_attr("href"):
+            if _anchor_wraps_360doc_download_img(tag):
+                continue
             nodes.append((tag, "href", "href"))
         elif name == "source" and tag.has_attr("src"):
             nodes.append((tag, "src", "src"))
@@ -410,6 +931,44 @@ def collect_resource_nodes(soup: BeautifulSoup) -> list[tuple[Tag, str, str]]:
             if ra:
                 nodes.append((tag, ra, "src"))
     return nodes
+
+
+def _suffix_from_content_type(content_type: str, fallback: str) -> str:
+    ct = (content_type or "").lower().split(";", 1)[0].strip()
+    if ct in ("image/jpeg", "image/jpg"):
+        return ".jpeg"
+    if ct == "image/png":
+        return ".png"
+    if ct == "image/gif":
+        return ".gif"
+    if ct == "image/webp":
+        return ".webp"
+    if ct == "image/bmp":
+        return ".bmp"
+    if ct == "image/svg+xml":
+        return ".svg"
+    return fallback
+
+
+def _suffix_from_magic(data: bytes) -> str | None:
+    if not data:
+        return None
+    if data.startswith(b"\xFF\xD8\xFF"):
+        return ".jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith(b"<svg") or data.startswith(b"<?xml"):
+        # SVG 文件常以 XML 声明或 svg 标签开头。
+        head = data[:200].lower()
+        if b"<svg" in head:
+            return ".svg"
+    return None
 
 
 def suffix_from_url(url: str, fallback: str) -> str:
@@ -429,10 +988,12 @@ def localize_resources(
     session: requests.Session,
     *,
     article_id: str,
-) -> int:
+    article_title: str,
+    article_dir_name: str,
+) -> ResourceLocalizationResult:
     resource_nodes = collect_resource_nodes(clean_soup)
     if not resource_nodes:
-        return 0
+        return ResourceLocalizationResult(downloaded=0, failed_urls=[])
 
     plan: list[tuple[Tag, str, str, str]] = []
     for tag, read_attr, write_attr in resource_nodes:
@@ -444,53 +1005,388 @@ def localize_resources(
         plan.append((tag, read_attr, write_attr, abs_url))
 
     if not plan:
-        return 0
+        return ResourceLocalizationResult(downloaded=0, failed_urls=[])
 
     res_dir = clean_output_path.with_suffix("")
     downloaded = 0
+    failed_urls: list[str] = []
     url_to_local: dict[str, str] = {}
-    # 按「首次出现的可下载 URL」连续编号 res_1、res_2…，与 plan 下标脱钩。
-    # 否则同一 URL 在多个 <a>/<img> 上重复时，用 enumerate 会得到 res_4、res_7 等跳号，
-    # 且遇已存在文件时生成 res_1_1.jpg，易与残留 res_1.jpg 错位，浏览器与 Word 均无法加载。
-    file_seq = 0
-    for tag, read_attr, write_attr, abs_url in plan:
-        if abs_url in url_to_local:
-            tag[write_attr] = url_to_local[abs_url]
+
+    # 按首次出现顺序去重，保证 res_ 序号稳定且与历史行为一致。
+    unique_urls: list[str] = []
+    url_meta: dict[str, tuple[int, str]] = {}
+    url_primary_tag: dict[str, Tag] = {}
+    for tag, _, write_attr, abs_url in plan:
+        if abs_url in url_meta:
             continue
-        try:
-            resp = request_with_retry(
-                session,
-                abs_url,
-                headers={
-                    "Referer": source_url,
-                    "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
-                },
+        unique_urls.append(abs_url)
+        file_seq = len(unique_urls)
+        fallback_ext = ".html" if write_attr == "href" else ".bin"
+        url_meta[abs_url] = (file_seq, fallback_ext)
+        url_primary_tag[abs_url] = tag
+
+    signed_full_map: dict[str, str] | None = None
+    signed_path_map: dict[str, str] | None = None
+    changed_url_cache: dict[str, str] = {}
+    changed_path_map: dict[str, str] = {}
+    cache_lock = threading.Lock()
+    domain_hint = _domain_hint_from_article_dir(article_dir_name)
+
+    def _get_signed_maps() -> tuple[dict[str, str], dict[str, str]]:
+        nonlocal signed_full_map, signed_path_map
+        if signed_full_map is None or signed_path_map is None:
+            signed_full_map, signed_path_map = _build_article_signed_src_candidates(
+                session, source_url
             )
+        return signed_full_map, signed_path_map
+
+    def _candidate_urls_for_primary(url: str) -> list[str]:
+        cands: list[str] = []
+        now_ts = int(time.time())
+
+        def _add(u: str) -> None:
+            uu = _prefer_legacy_360doc_http((u or "").strip())
+            if not uu:
+                return
+            # 带签名 URL 若已过期或将过期，直接跳过，避免优先命中旧签名。
+            try:
+                pu = urlparse(uu)
+                if pu.query and "signature=" in pu.query.lower():
+                    qs = dict(parse_qsl(pu.query, keep_blank_values=True))
+                    exp_raw = str(qs.get("Expires", "")).strip()
+                    if exp_raw.isdigit() and int(exp_raw) <= now_ts + 15:
+                        return
+            except Exception:
+                pass
+            if uu in cands:
+                return
+            cands.append(uu)
+
+        _add(url)
+        _add(_https_variant(url))
+        _add(_strip_url_query(url))
+        _add(_https_variant(_strip_url_query(url)))
+
+        tg = url_primary_tag.get(url)
+        raw_primary_host = ""
+        if isinstance(tg, Tag):
+            raw_src = str(tg.get("src", "")).strip()
+            src_abs = _prefer_working_360doc_image_host(normalize_url(raw_src, source_url))
+            if is_localizable_url(src_abs):
+                try:
+                    raw_primary_host = (urlparse(src_abs).netloc or "").lower()
+                except Exception:
+                    raw_primary_host = ""
+                _add(src_abs)
+                _add(_https_variant(src_abs))
+                _add(_strip_url_query(src_abs))
+                _add(_https_variant(_strip_url_query(src_abs)))
+
+        fm, pm = _get_signed_maps()
+        if url in fm:
+            _add(fm[url])
+            _add(_https_variant(fm[url]))
+        nq = _strip_url_query(url)
+        if nq in fm:
+            _add(fm[nq])
+            _add(_https_variant(fm[nq]))
+        pkey = _url_path_key(url)
+        if pkey and pkey in pm:
+            _add(pm[pkey])
+            _add(_https_variant(pm[pkey]))
+
+        # Frontend fallback path: call imgurl.ashx?op=changeurl to request a fresh backend-signed URL.
+        with cache_lock:
+            cached_changed = changed_url_cache.get(url)
+        if not cached_changed:
+            pkey2 = _url_path_key(url)
+            if pkey2:
+                with cache_lock:
+                    cached_changed = changed_path_map.get(pkey2, "")
+        if not cached_changed:
+            try:
+                by_input, by_path = _request_changeurl_signed_images(
+                    session, source_url, [url]
+                )
+                fresh = by_input.get(url, "")
+                if not fresh:
+                    fresh = by_path.get(_url_path_key(url), "")
+                with cache_lock:
+                    if fresh:
+                        changed_url_cache[url] = fresh
+                        p = _url_path_key(fresh)
+                        if p:
+                            changed_path_map[p] = fresh
+                cached_changed = fresh
+            except Exception:
+                cached_changed = ""
+        if cached_changed:
+            _add(cached_changed)
+            _add(_https_variant(cached_changed))
+            # 域名容灾：同一签名 URL 在单节点 502 时，改写到同族 host 再试。
+            try:
+                ch_host = (urlparse(cached_changed).netloc or "").lower()
+            except Exception:
+                ch_host = ""
+            fallback_hosts: list[str] = []
+            if raw_primary_host:
+                fallback_hosts.extend(_legacy_360doc_host_family(raw_primary_host))
+            fallback_hosts.extend(_legacy_360doc_host_family(ch_host))
+            for fh in fallback_hosts:
+                if fh == ch_host:
+                    continue
+                rw = _rewrite_url_host(cached_changed, fh)
+                _add(rw)
+                _add(_https_variant(rw))
+
+        # 额外容错：若已有 Signature，按当前时间戳和分类 artnum(domain) 组一个变体再试一次。
+        # 说明：不改变 Signature 本体，仅做参数层面的轻量补参重试。
+        for base in list(cands):
+            try:
+                p = urlparse(base)
+                if not p.query or "signature=" not in p.query.lower():
+                    continue
+                qs = dict(parse_qsl(p.query, keep_blank_values=True))
+                qs["Expires"] = str(int(time.time()))
+                if domain_hint:
+                    qs["domain"] = domain_hint
+                q2 = urlencode(qs, doseq=True)
+                _add(urlunparse((p.scheme, p.netloc, p.path, p.params, q2, p.fragment)))
+            except Exception:
+                continue
+        return cands
+
+    def _fetch_one(url: str) -> tuple[str, str, bytes | None, str | None, Exception | None]:
+        # Return tuple: (url, status, data, ext, err), where status is ok|not_found|failed.
+        time.sleep(random.uniform(*RESOURCE_START_JITTER_SEC))
+        last_exc: Exception | None = None
+        saw_not_found = False
+        saw_non_not_found = False
+        candidates = list(_candidate_urls_for_primary(url))
+        tried: set[str] = set()
+        attempts = 0
+        refresh_retries = 0
+        while candidates and attempts < RESOURCE_MAX_ATTEMPTS_PER_URL:
+            cu = (candidates.pop(0) or "").strip()
+            if not cu or cu in tried:
+                continue
+            tried.add(cu)
+            attempts += 1
+            try:
+                resp = request_with_retry(
+                    session,
+                    cu,
+                    headers={
+                        "Referer": source_url,
+                        "Accept": (
+                            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+                        ),
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Sec-Fetch-Dest": "image",
+                        "Sec-Fetch-Mode": "no-cors",
+                        "Sec-Fetch-Site": "cross-site",
+                        "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
+                    },
+                    timeout=RESOURCE_REQUEST_TIMEOUT,
+                    retries=RESOURCE_REQUEST_RETRIES,
+                    use_session_cookies=("signature=" not in cu.lower()),
+                    bypass_env_proxy=True,
+                )
+                _, fallback_ext = url_meta[url]
+                ext = suffix_from_url(cu, fallback_ext)
+                magic_ext = _suffix_from_magic(resp.content)
+                if magic_ext:
+                    ext = magic_ext
+                if ext in (".bin", ".html"):
+                    ext = _suffix_from_content_type(
+                        resp.headers.get("content-type", ""),
+                        ext,
+                    )
+                return (url, "ok", resp.content, ext, None)
+            except CleanRateLimitError:
+                raise
+            except ResourceExpiredError as exc:
+                last_exc = exc
+                saw_non_not_found = True
+                # 惰性刷新：签名过期时实时向 changeurl 再要一次新签名 URL。
+                if refresh_retries >= RESOURCE_MAX_REFRESH_RETRIES:
+                    continue
+                try:
+                    by_input, by_path = _request_changeurl_signed_images(
+                        session, source_url, [url]
+                    )
+                    fresh = by_input.get(url, "")
+                    if not fresh:
+                        fresh = by_path.get(_url_path_key(url), "")
+                    if fresh:
+                        with cache_lock:
+                            changed_url_cache[url] = fresh
+                            p = _url_path_key(fresh)
+                            if p:
+                                changed_path_map[p] = fresh
+                        if fresh not in tried:
+                            candidates.insert(0, fresh)
+                            refresh_retries += 1
+                except Exception:
+                    pass
+                continue
+            except ResourceGatewayError as exc:
+                last_exc = exc
+                saw_non_not_found = True
+                # 网关抖动（502/503/504）时同样刷新一条新签名 URL 再试。
+                if refresh_retries >= RESOURCE_MAX_REFRESH_RETRIES:
+                    continue
+                try:
+                    by_input, by_path = _request_changeurl_signed_images(
+                        session, source_url, [url]
+                    )
+                    fresh = by_input.get(url, "")
+                    if not fresh:
+                        fresh = by_path.get(_url_path_key(url), "")
+                    if fresh:
+                        with cache_lock:
+                            changed_url_cache[url] = fresh
+                            p = _url_path_key(fresh)
+                            if p:
+                                changed_path_map[p] = fresh
+                        if fresh not in tried:
+                            candidates.insert(0, fresh)
+                            refresh_retries += 1
+                except Exception:
+                    pass
+                continue
+            except ResourceNotFoundError as exc:
+                saw_not_found = True
+                last_exc = exc
+                # 404/NotFound 时也尝试刷新一条签名 URL 再试，避免直链 check* 404 误判。
+                if refresh_retries >= RESOURCE_MAX_REFRESH_RETRIES:
+                    continue
+                try:
+                    by_input, by_path = _request_changeurl_signed_images(
+                        session, source_url, [url]
+                    )
+                    fresh = by_input.get(url, "")
+                    if not fresh:
+                        fresh = by_path.get(_url_path_key(url), "")
+                    if fresh:
+                        with cache_lock:
+                            changed_url_cache[url] = fresh
+                            p = _url_path_key(fresh)
+                            if p:
+                                changed_path_map[p] = fresh
+                        if fresh not in tried:
+                            candidates.insert(0, fresh)
+                            refresh_retries += 1
+                except Exception:
+                    pass
+                continue
+            except Exception as exc:
+                if isinstance(exc, requests.exceptions.SSLError) and cu.startswith("https://"):
+                    fallback_http = "http://" + cu[len("https://") :]
+                    fallback_http = _prefer_legacy_360doc_http(fallback_http)
+                    if fallback_http not in tried:
+                        candidates.insert(0, fallback_http)
+                last_exc = exc
+                saw_non_not_found = True
+                continue
+        if saw_not_found and not saw_non_not_found and last_exc is not None:
+            return (url, "not_found", None, None, last_exc)
+        if attempts >= RESOURCE_MAX_ATTEMPTS_PER_URL and last_exc is not None:
+            return (
+                url,
+                "failed",
+                None,
+                None,
+                RuntimeError(
+                    f"resource retry exhausted attempts={attempts} refresh={refresh_retries} last={last_exc}"
+                ),
+            )
+        return (url, "failed", None, None, last_exc or RuntimeError("resource download failed"))
+
+    workers = max(1, min(RESOURCE_DOWNLOAD_MAX_WORKERS, len(unique_urls)))
+    log_info(
+        f"资源下载开始 art={article_id} total={len(unique_urls)} workers={workers}"
+    )
+    results: dict[str, tuple[str, bytes | None, str | None, Exception | None]] = {}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
+        fut2url = {ex.submit(_fetch_one, u): u for u in unique_urls}
+        pending: set[concurrent.futures.Future] = set(fut2url.keys())
+        done_count = 0
+        last_hb = time.time()
+        while pending:
+            done_now, pending = concurrent.futures.wait(
+                pending,
+                timeout=1.0,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for fut in done_now:
+                u = fut2url[fut]
+                try:
+                    _, st, data, ext, err = fut.result()
+                except CleanRateLimitError:
+                    raise
+                results[u] = (st, data, ext, err)
+                done_count += 1
+                if done_count == 1 or done_count % 10 == 0 or done_count == len(unique_urls):
+                    log_info(
+                        f"资源下载进度 art={article_id} {done_count}/{len(unique_urls)}"
+                    )
+            now = time.time()
+            if now - last_hb >= RESOURCE_PROGRESS_HEARTBEAT_SEC and pending:
+                log_info(
+                    f"资源下载心跳 art={article_id} done={done_count} pending={len(pending)}"
+                )
+                last_hb = now
+    except KeyboardInterrupt:
+        log_warn(f"资源下载被中断 art={article_id}，正在取消剩余任务...")
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    for abs_url in unique_urls:
+        st, data, ext, err = results.get(abs_url, ("failed", None, None, RuntimeError("missing result")))
+        seq, fallback_ext = url_meta[abs_url]
+        if st == "ok" and data is not None and ext is not None:
             if not res_dir.exists():
                 res_dir.mkdir(parents=True, exist_ok=True)
-            fallback_ext = ".html" if write_attr == "href" else ".bin"
-            ext = suffix_from_url(abs_url, fallback_ext)
-            file_seq += 1
             local_name = sanitize_name(
-                f"res_{file_seq}{ext}", f"res_{file_seq}{fallback_ext}"
+                f"res_{seq}{ext}", f"res_{seq}{fallback_ext}"
             )
             local_path = res_dir / local_name
-            local_path.write_bytes(resp.content)
+            local_path.write_bytes(data)
             rel_ref = f"{res_dir.name}/{local_name}"
-            tag[write_attr] = rel_ref
             url_to_local[abs_url] = rel_ref
             downloaded += 1
-        except Exception as exc:
+        elif st == "not_found":
+            append_resource_not_found_warning_line(
+                f"article_id={article_id}\tarticle={article_title}\tdir={article_dir_name}"
+                f"\tresource={abs_url}\tnot_found=1"
+            )
+        else:
+            exc = err or RuntimeError("resource download failed")
             log_warn(f"资源下载失败 {abs_url} err={exc}")
-            append_clean_error_url_line(f"{article_id}-{abs_url}-{exc}")
-        finally:
-            time.sleep(random.uniform(*RESOURCE_REQUEST_SLEEP_SEC))
+            failed_urls.append(abs_url)
+            append_clean_resource_failure_line(
+                article_id=article_id,
+                article_title=article_title,
+                article_dir_name=article_dir_name,
+                resource_url=abs_url,
+                error=exc,
+            )
+        time.sleep(random.uniform(*RESOURCE_REQUEST_SLEEP_SEC))
+
+    for tag, _, write_attr, abs_url in plan:
+        ref = url_to_local.get(abs_url)
+        if ref:
+            tag[write_attr] = ref
     _heal_imgs_missing_src_from_parent_anchor(clean_soup)
-    return downloaded
+    return ResourceLocalizationResult(downloaded=downloaded, failed_urls=failed_urls)
 
 
 def _heal_imgs_missing_src_from_parent_anchor(soup: BeautifulSoup) -> None:
-    # img 无 src 时从外层 <a href=本地图> 补 src。
+    # When img src is missing, fallback to parent <a href> local path and fill src.
     root = soup.select_one("#content")
     if root is None:
         return
@@ -637,7 +1533,7 @@ def _rgb_word_hex(rgb: RGBColor) -> str:
 
 
 def _apply_ctx_to_run(run, ctx: _RunCtx, default_pt: Pt) -> None:
-    fn = ctx.font_name or "等线"
+    fn = ctx.font_name or "绛夌嚎"
     _set_run_east_asia(run, fn)
     if ctx.font_pt is not None:
         run.font.size = Pt(ctx.font_pt)
@@ -715,7 +1611,7 @@ def _append_ox_text_run(
     sz_cs.set(qn("w:val"), half)
     r_pr.append(sz_cs)
     r_fonts = OxmlElement("w:rFonts")
-    fn = ctx.font_name or "等线"
+    fn = ctx.font_name or "绛夌嚎"
     r_fonts.set(qn("w:ascii"), fn)
     r_fonts.set(qn("w:hAnsi"), fn)
     r_fonts.set(qn("w:eastAsia"), fn)
@@ -851,7 +1747,7 @@ def _walk_inline_to_hyperlink_ox(
         )
 
 
-# 浮动图 z-order，避免多个 anchor 相对高度重复导致叠盖
+# Base z-order for floating anchors, preventing overlap from repeated relative-height values.
 _ANCHOR_RELATIVE_HEIGHT_NEXT = 251_658_240
 
 
@@ -862,7 +1758,7 @@ def _next_anchor_relative_height() -> int:
 
 
 def _strip_line_breaks_after_drawing_in_run(run) -> None:
-    # 去掉紧跟在图片后的软换行，避免与上下型环绕叠加产生多余空行。
+    # Remove soft breaks right after drawings to avoid extra blank lines with top/bottom wrapping.
     r_el = run._element
     seen_drawing = False
     for child in list(r_el):
@@ -874,7 +1770,7 @@ def _strip_line_breaks_after_drawing_in_run(run) -> None:
 
 
 def _convert_run_inline_picture_to_top_bottom_wrap(run) -> None:
-    # 将 add_picture 生成的 wp:inline 改为 wp:anchor，并设为上下型文字环绕（类似 Word「上下型」）。
+    # Convert wp:inline from add_picture() into wp:anchor with top-and-bottom text wrapping.
     r_el = run._element
     drawing = r_el.find(qn("w:drawing"))
     if drawing is None:
@@ -936,9 +1832,30 @@ def _convert_run_inline_picture_to_top_bottom_wrap(run) -> None:
 
 def _add_picture_top_bottom_wrap(paragraph, image_path: str, width) -> None:
     run = paragraph.add_run()
-    run.add_picture(str(image_path), width=width)
+    try:
+        run.add_picture(str(image_path), width=width)
+    except (UnrecognizedImageError, OSError, ValueError):
+        # Fallback for WEBP/CMYK/legacy formats that python-docx cannot parse directly.
+        with Image.open(str(image_path)) as im:
+            try:
+                im.seek(0)
+            except Exception:
+                pass
+            if im.mode not in ("RGB", "RGBA", "L", "LA"):
+                im = im.convert("RGBA")
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            buf.seek(0)
+            run.add_picture(buf, width=width)
     _convert_run_inline_picture_to_top_bottom_wrap(run)
     _strip_line_breaks_after_drawing_in_run(run)
+
+
+def _exc_brief(exc: Exception) -> str:
+    msg = str(exc).strip()
+    if msg:
+        return f"{type(exc).__name__}: {msg}"
+    return type(exc).__name__
 
 
 def _paragraph_add_external_hyperlink(
@@ -980,13 +1897,13 @@ def _add_inline_image_to_paragraph(
         try:
             _add_picture_top_bottom_wrap(paragraph, str(local), Inches(5.5))
         except Exception as exc:
-            log_warn(f"插入图片失败 {local}: {exc}")
-            r2 = paragraph.add_run(f"[图片 {src}]")
-            _set_run_east_asia(r2, "等线")
+            log_warn(f"插入图片失败 {local}: {_exc_brief(exc)}")
+            r2 = paragraph.add_run(f"[鍥剧墖 {src}]")
+            _set_run_east_asia(r2, "绛夌嚎")
             r2.font.size = DEFAULT_BODY_PT
     else:
-        r2 = paragraph.add_run(f"[图片 {src}]")
-        _set_run_east_asia(r2, "等线")
+        r2 = paragraph.add_run(f"[鍥剧墖 {src}]")
+        _set_run_east_asia(r2, "绛夌嚎")
 
 
 def _tag_class_list(tag: Tag) -> list[str]:
@@ -997,7 +1914,7 @@ def _tag_class_list(tag: Tag) -> list[str]:
 
 
 def _normalize_navigable_text_for_docx(raw: str) -> str:
-    # 压缩站点里常见的 NBSP/空格填充，避免 Word 里出现「每页一行」的假稀疏排版。
+    # Normalize common NBSP/space padding patterns to avoid one-character-per-line layout artifacts.
     if not raw:
         return raw
     t = raw.replace("\u00a0", " ").replace("\u2003", " ").replace("\u2002", " ")
@@ -1128,7 +2045,7 @@ def _walk_inline_to_paragraph(
                 try:
                     _add_picture_top_bottom_wrap(paragraph, str(local), Inches(5.5))
                 except Exception as exc:
-                    log_warn(f"插入图片失败 {local}: {exc}")
+                    log_warn(f"插入图片失败 {local}: {_exc_brief(exc)}")
             return
         if href and not href.startswith("#") and not hl.startswith(
             ("javascript:", "mailto:", "tel:")
@@ -1173,26 +2090,8 @@ def _walk_inline_to_paragraph(
         _w(ch, ctx)
 
 
-def _add_text_runs_to_paragraph(
-    paragraph,
-    node,
-    *,
-    default_pt,
-    base_dir: Path | None = None,
-    article_clean_html: Path | None = None,
-) -> None:
-    _walk_inline_to_paragraph(
-        paragraph,
-        node,
-        _RunCtx(),
-        default_pt,
-        base_dir=base_dir,
-        article_clean_html=article_clean_html,
-    )
-
-
 def _img_src_for_local_resolve(img: Tag) -> str:
-    # img 无可用 src 时，回退读取外层 <a href> 中的本地图片路径（历史清洗 HTML 可能仅有链接无 src）。
+    # Resolve img src with fallback to parent <a href> local path for legacy cleaned HTML.
     s = str(img.get("src", "")).strip()
     if s and not s.startswith("data:"):
         return s
@@ -1206,7 +2105,7 @@ def _img_src_for_local_resolve(img: Tag) -> str:
 
 
 def _res_basename_without_collision_suffix(bare: str) -> str | None:
-    # res_10_4.jpg -> res_10.jpg（历史避撞命名与主文件并存时供回退查找）。
+    # res_10_4.jpg -> res_10.jpg fallback for historical collision-avoidance naming.
     m = re.match(r"^(res_\d+)_\d+(\.[^.]+)$", bare, re.I)
     if m:
         return m.group(1) + m.group(2)
@@ -1214,7 +2113,7 @@ def _res_basename_without_collision_suffix(bare: str) -> str | None:
 
 
 def _media_rel_key_for_dedupe(tag: Tag) -> str | None:
-    # 同一段内多个空 <a href=同一本地图> 与带图 <a> 去重，避免 Word 里同一张图插三遍。
+    # De-duplicate empty-link and image-link variants in one paragraph to prevent duplicate inserts.
     im = tag.find("img")
     if isinstance(im, Tag):
         s = _img_src_for_local_resolve(im)
@@ -1243,7 +2142,7 @@ def _is_block_media_tag(tag: Tag) -> bool:
 
 
 def _path_under_article_base(path: Path, base_resolved: Path) -> bool:
-    # 判断 path 是否在 base 目录内；Windows 下 resolve/长短路径可能导致 strict relative_to 失败。
+    # Check whether path is under base; Windows path resolution can break strict relative_to checks.
     try:
         path.resolve().relative_to(base_resolved)
         return True
@@ -1301,12 +2200,12 @@ def _append_centered_picture_to_paragraph(
         try:
             _add_picture_top_bottom_wrap(p, str(local), Inches(5.5))
         except Exception as exc:
-            log_warn(f"插入图片失败 {local}: {exc}")
-            r2 = p.add_run(f"[图片 {src}]")
-            _set_run_east_asia(r2, "等线")
+            log_warn(f"插入图片失败 {local}: {_exc_brief(exc)}")
+            r2 = p.add_run(f"[鍥剧墖 {src}]")
+            _set_run_east_asia(r2, "绛夌嚎")
     else:
-        r2 = p.add_run(f"[图片 {src}]")
-        _set_run_east_asia(r2, "等线")
+        r2 = p.add_run(f"[鍥剧墖 {src}]")
+        _set_run_east_asia(r2, "绛夌嚎")
 
 
 def _fill_paragraph_with_media(
@@ -1337,14 +2236,14 @@ def _fill_paragraph_with_media(
                     try:
                         _add_picture_top_bottom_wrap(p, str(local), Inches(5.5))
                     except Exception as exc:
-                        log_warn(f"插入图片失败 {local}: {exc}")
-                        r2 = p.add_run(f"[图片 {href}]")
-                        _set_run_east_asia(r2, "等线")
+                        log_warn(f"插入图片失败 {local}: {_exc_brief(exc)}")
+                        r2 = p.add_run(f"[鍥剧墖 {href}]")
+                        _set_run_east_asia(r2, "绛夌嚎")
                     return
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _apply_body_paragraph_format(p)
-        run = p.add_run(tag.get_text(strip=True) or "[媒体]")
-        _set_run_east_asia(run, "等线")
+        run = p.add_run(tag.get_text(strip=True) or "[濯掍綋]")
+        _set_run_east_asia(run, "绛夌嚎")
         run.font.size = DEFAULT_BODY_PT
         return
 
@@ -1636,7 +2535,7 @@ def _emit_ol(
                 )
 
 
-# td/th/tr 等：当作容器展开子节点，避免 Word 把整段正文压成单段。
+# Unwrap td/th/tr as containers so Word does not collapse entire body content into a single paragraph.
 _BLOCK_UNWRAP = frozenset(
     {
         "article",
@@ -1753,7 +2652,7 @@ def _emit_content_node(
         hp = doc.add_paragraph()
         _apply_body_paragraph_format(hp)
         r = hp.add_run("―" * 28)
-        _set_run_east_asia(r, "等线")
+        _set_run_east_asia(r, "绛夌嚎")
         r.font.size = DEFAULT_BODY_PT
         r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
         return
@@ -1999,7 +2898,7 @@ def clean_html_path_for_raw(raw_html_path: Path) -> Path:
 
 
 def article_raw_and_clean_paths(path: Path) -> tuple[Path, Path]:
-    # 若 path 为孤儿 clean_ 文件则 (raw, clean)；否则 (raw, clean_html_path_for_raw(raw))。
+    # If path is orphan clean_ HTML, return (raw, clean); otherwise return (raw, clean_html_path_for_raw(raw)).
     name = path.name
     if name.lower().startswith(CLEAN_HTML_PREFIX.lower()):
         raw = path.with_name(name[len(CLEAN_HTML_PREFIX) :])
@@ -2011,13 +2910,17 @@ def res_dir_for_clean(clean_path: Path) -> Path:
     return clean_path.with_suffix("")
 
 
-def _remove_article_sidecars(raw_path: Path) -> None:
-    cc = clean_html_path_for_raw(raw_path)
-    if cc.is_file():
-        cc.unlink(missing_ok=True)
-    rd = res_dir_for_clean(cc)
+def _remove_clean_outputs(clean_path: Path) -> None:
+    if clean_path.is_file():
+        clean_path.unlink(missing_ok=True)
+    rd = res_dir_for_clean(clean_path)
     if rd.is_dir():
         shutil.rmtree(rd, ignore_errors=True)
+
+
+def _remove_article_sidecars(raw_path: Path) -> None:
+    cc = clean_html_path_for_raw(raw_path)
+    _remove_clean_outputs(cc)
 
 
 def process_one_article(
@@ -2030,12 +2933,13 @@ def process_one_article(
     gen_docx: bool,
     force_docx: bool,
 ) -> tuple[str, bool]:
-    # 返回 (status, did_clean_write)。
+    # Return value: (status, did_clean_write).
     # status: skipped | processed | failed | skipped_docx
     raw_path, clean_path = article_raw_and_clean_paths(path)
     docx_path = docx_path_for_article_html(raw_path)
     article_id = extract_article_id(raw_path)
     source_url = guess_source_url(raw_path)
+    article_dir_name = raw_path.parent.name or "unknown"
 
     if r_clean_only:
         if not gen_docx:
@@ -2064,25 +2968,38 @@ def process_one_article(
             text = src_html.read_text(encoding="utf-8", errors="ignore")
             soup = BeautifulSoup(text, "html.parser")
             title, author, publish_date = extract_article_meta(soup)
-            content = extract_body_tag_standard(soup)
-            if content is None:
-                word_meta = parse_word_document_meta(text)
-                if word_meta:
-                    word_base, page_count = word_meta
-                    content = fetch_word_preview_body(
-                        session, word_base, page_count, source_url, article_id
-                    )
+            article_title = title or raw_path.stem
+            content = resolve_content_node(
+                soup=soup,
+                raw_html=text,
+                session=session,
+                source_url=source_url,
+                article_id=article_id,
+                article_title=article_title,
+                article_dir_name=article_dir_name,
+            )
             if content is None:
                 raise ValueError("未找到正文容器")
             clean_soup = build_clean_soup(title, author, publish_date, content)
             with tempfile.TemporaryDirectory() as tmp:
                 tdir = Path(tmp)
                 tmp_clean = tdir / f"{CLEAN_HTML_PREFIX}article.html"
-                n_resources = localize_resources(
-                    clean_soup, source_url, tmp_clean, session, article_id=article_id
+                rs = localize_resources(
+                    clean_soup,
+                    source_url,
+                    tmp_clean,
+                    session,
+                    article_id=article_id,
+                    article_title=article_title,
+                    article_dir_name=article_dir_name,
                 )
+                if rs.failed_urls:
+                    append_clean_article_error_line(
+                        f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
+                        f"\tresource_failed={len(rs.failed_urls)}"
+                    )
                 tmp_clean.write_text(str(clean_soup), encoding="utf-8")
-                if n_resources > 0:
+                if rs.downloaded > 0:
                     time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
                 if convert_clean_html_file_to_docx(
                     tmp_clean, docx_path, force=True
@@ -2093,11 +3010,18 @@ def process_one_article(
                         raw_path.unlink(missing_ok=True)
                     return "processed", False
                 return "failed", False
+        except CleanRateLimitError:
+            raise
         except Exception as exc:
             log_warn(f"清洗/转换失败 {path.name}: {exc}")
+            append_clean_article_error_line(
+                f"{article_id}\tarticle={raw_path.stem}\tdir={article_dir_name}"
+                f"\tstatus=clean_failed\terr={exc}"
+            )
+            _remove_clean_outputs(clean_path)
             return "failed", False
 
-    # 常规：写入磁盘上的 clean_ 前缀 HTML
+    # Normal path: write clean_ prefixed HTML to disk.
     if not force_clean and clean_path.is_file():
         if gen_docx:
             try:
@@ -2120,25 +3044,35 @@ def process_one_article(
         text = src_html.read_text(encoding="utf-8", errors="ignore")
         soup = BeautifulSoup(text, "html.parser")
         title, author, publish_date = extract_article_meta(soup)
-        content = extract_body_tag_standard(soup)
-        if content is None:
-            word_meta = parse_word_document_meta(text)
-            if word_meta:
-                word_base, page_count = word_meta
-                log_info(
-                    f"Word 预览正文 art={article_id} pages={page_count} base={word_base}"
-                )
-                content = fetch_word_preview_body(
-                    session, word_base, page_count, source_url, article_id
-                )
+        article_title = title or raw_path.stem
+        content = resolve_content_node(
+            soup=soup,
+            raw_html=text,
+            session=session,
+            source_url=source_url,
+            article_id=article_id,
+            article_title=article_title,
+            article_dir_name=article_dir_name,
+        )
         if content is None:
             raise ValueError("未找到正文容器")
         clean_soup = build_clean_soup(title, author, publish_date, content)
-        n_resources = localize_resources(
-            clean_soup, source_url, clean_path, session, article_id=article_id
+        rs = localize_resources(
+            clean_soup,
+            source_url,
+            clean_path,
+            session,
+            article_id=article_id,
+            article_title=article_title,
+            article_dir_name=article_dir_name,
         )
+        if rs.failed_urls:
+            append_clean_article_error_line(
+                f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
+                f"\tresource_failed={len(rs.failed_urls)}"
+            )
         clean_path.write_text(str(clean_soup), encoding="utf-8")
-        if n_resources > 0:
+        if rs.downloaded > 0:
             time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
         log_info(f"已清洗: {raw_path.name} -> {clean_path.name}")
         wrote = True
@@ -2153,8 +3087,16 @@ def process_one_article(
             except Exception as exc:
                 log_warn(f"docx 失败 {clean_path}: {exc}")
         return "processed", wrote
+    except CleanRateLimitError:
+        _remove_clean_outputs(clean_path)
+        raise
     except Exception as exc:
         log_warn(f"清洗失败 {path.name}: {exc}")
+        append_clean_article_error_line(
+            f"{article_id}\tarticle={raw_path.stem}\tdir={article_dir_name}"
+            f"\tstatus=clean_failed\terr={exc}"
+        )
+        _remove_clean_outputs(clean_path)
         return "failed", False
 
 
@@ -2165,35 +3107,49 @@ def docx_from_raw_html_via_temp(
     force_docx: bool,
     remove_original: bool = False,
 ) -> str:
-    # 不写 clean_ 前缀 HTML 到输出目录，在临时目录中清洗并生成与 raw 同名的 .docx。
+    # Word-only path: clean in temp dir without writing clean_ HTML to output tree.
     docx_path = docx_path_for_article_html(path)
     if docx_path.exists() and not force_docx:
         return "skipped"
     article_id = extract_article_id(path)
     source_url = guess_source_url(path)
+    article_dir_name = path.parent.name or "unknown"
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
         soup = BeautifulSoup(text, "html.parser")
         title, author, publish_date = extract_article_meta(soup)
-        content = extract_body_tag_standard(soup)
-        if content is None:
-            word_meta = parse_word_document_meta(text)
-            if word_meta:
-                word_base, page_count = word_meta
-                content = fetch_word_preview_body(
-                    session, word_base, page_count, source_url, article_id
-                )
+        article_title = title or path.stem
+        content = resolve_content_node(
+            soup=soup,
+            raw_html=text,
+            session=session,
+            source_url=source_url,
+            article_id=article_id,
+            article_title=article_title,
+            article_dir_name=article_dir_name,
+        )
         if content is None:
             raise ValueError("未找到正文容器")
         clean_soup = build_clean_soup(title, author, publish_date, content)
         with tempfile.TemporaryDirectory() as tmp:
             tdir = Path(tmp)
             tmp_clean = tdir / f"{CLEAN_HTML_PREFIX}article.html"
-            n_resources = localize_resources(
-                clean_soup, source_url, tmp_clean, session, article_id=article_id
+            rs = localize_resources(
+                clean_soup,
+                source_url,
+                tmp_clean,
+                session,
+                article_id=article_id,
+                article_title=article_title,
+                article_dir_name=article_dir_name,
             )
+            if rs.failed_urls:
+                append_clean_article_error_line(
+                    f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
+                    f"\tresource_failed={len(rs.failed_urls)}"
+                )
             tmp_clean.write_text(str(clean_soup), encoding="utf-8")
-            if n_resources > 0:
+            if rs.downloaded > 0:
                 time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
             if convert_clean_html_file_to_docx(tmp_clean, docx_path, force=True):
                 log_info(f"[docx] {docx_path}")
@@ -2201,8 +3157,14 @@ def docx_from_raw_html_via_temp(
                     path.unlink(missing_ok=True)
                 return "processed"
             return "failed"
+    except CleanRateLimitError:
+        raise
     except Exception as exc:
         log_warn(f"仅 Word 转换失败 {path}: {exc}")
+        append_clean_article_error_line(
+            f"{article_id}\tarticle={path.stem}\tdir={article_dir_name}"
+            f"\tstatus=clean_failed\terr={exc}"
+        )
         return "failed"
 
 
@@ -2218,6 +3180,7 @@ def run_clean_and_word_pass(
     r_clean_only: bool,
     limit: int = 0,
     remove_raw_when_word_only: bool = False,
+    clean_article_pacing_sec: tuple[float, float] | None = None,
 ) -> int:
     if not enable_clean and not gen_word:
         return 0
@@ -2228,8 +3191,65 @@ def run_clean_and_word_pass(
         log_warn("未找到待处理的文库 HTML。")
         return 0
     ok = fail = skip = 0
+    use_clean_pacing = bool(clean_article_pacing_sec and (enable_clean or r_clean_only))
+    pacing_lo = pacing_hi = 0.0
+    if use_clean_pacing:
+        assert clean_article_pacing_sec is not None
+        pacing_lo, pacing_hi = clean_article_pacing_sec
+        if pacing_lo < 0:
+            pacing_lo = 0.0
+        if pacing_hi < pacing_lo:
+            pacing_hi = pacing_lo
+
+    # Local word-only mode: convert existing clean_ HTML directly with max workers.
+    if gen_word and not enable_clean and not r_clean_only:
+        max_workers = max(1, RESOURCE_DOWNLOAD_MAX_WORKERS)
+        tasks: list[tuple[Path, Path, Path]] = []
+        for fp in files:
+            raw_fp, clean_fp = article_raw_and_clean_paths(fp)
+            docx_path = docx_path_for_article_html(raw_fp)
+            if not clean_fp.is_file():
+                log_warn(f"本地 Word 模式跳过（缺 clean 文件）: {raw_fp.name}")
+                skip += 1
+                continue
+            tasks.append((raw_fp, clean_fp, docx_path))
+
+        def _word_local_worker(item: tuple[Path, Path, Path]) -> tuple[str, Path, Path]:
+            raw_fp, clean_fp, docx_path = item
+            try:
+                if convert_clean_html_file_to_docx(clean_fp, docx_path, force=force_docx):
+                    return "processed", raw_fp, docx_path
+                return "skipped", raw_fp, docx_path
+            except Exception as exc:
+                log_warn(f"docx 失败 {clean_fp}: {exc}")
+                return "failed", raw_fp, docx_path
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_word_local_worker, item) for item in tasks]
+            for idx, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
+                st, raw_fp, docx_path = fut.result()
+                if st == "processed":
+                    log_info(f"[docx] {docx_path}")
+                    if remove_raw_when_word_only and raw_fp.is_file():
+                        raw_fp.unlink(missing_ok=True)
+                    ok += 1
+                elif st == "skipped":
+                    skip += 1
+                else:
+                    fail += 1
+                if idx % 20 == 0:
+                    log_info(f"清洗/Word 进度: {idx}/{len(tasks)}")
+
+        log_info(
+            f"清洗/Word 完成: 处理 {ok} / 跳过 {skip} / 失败 {fail} / 共 {len(files)}"
+        )
+        return fail
+
     for idx, fp in enumerate(files, start=1):
+        should_pace = use_clean_pacing
         if r_clean_only and gen_word:
+            _, clean_fp = article_raw_and_clean_paths(fp)
+            local_clean_ready = clean_fp.is_file() and (not force_clean)
             st, _ = process_one_article(
                 fp,
                 session,
@@ -2239,6 +3259,8 @@ def run_clean_and_word_pass(
                 gen_docx=True,
                 force_docx=force_docx,
             )
+            if local_clean_ready and st in {"processed", "skipped"}:
+                should_pace = False
             if st == "processed":
                 ok += 1
             elif st == "skipped":
@@ -2246,6 +3268,8 @@ def run_clean_and_word_pass(
             else:
                 fail += 1
         elif enable_clean:
+            _, clean_fp = article_raw_and_clean_paths(fp)
+            local_clean_ready = clean_fp.is_file() and (not force_clean)
             st, _ = process_one_article(
                 fp,
                 session,
@@ -2255,6 +3279,8 @@ def run_clean_and_word_pass(
                 gen_docx=gen_word,
                 force_docx=force_docx,
             )
+            if local_clean_ready and st in {"processed", "skipped"}:
+                should_pace = False
             if st == "processed":
                 ok += 1
             elif st == "skipped":
@@ -2296,15 +3322,192 @@ def run_clean_and_word_pass(
                 fail += 1
         if idx % 20 == 0:
             log_info(f"清洗/Word 进度: {idx}/{len(files)}")
+        if should_pace and idx < len(files):
+            time.sleep(random.uniform(pacing_lo, pacing_hi))
     log_info(
         f"清洗/Word 完成: 处理 {ok} / 跳过 {skip} / 失败 {fail} / 共 {len(files)}"
     )
     return fail
 
 
-def iter_raw_html_files(root: Path) -> list[Path]:
-    return iter_library_article_html_files(root)
+def _extract_not_found_log_entry(line: str) -> tuple[str, str] | None:
+    m_id = re.search(r"article_id=([0-9]+)", line)
+    m_res = re.search(r"resource=([^\t]+)", line)
+    if not m_id or not m_res:
+        return None
+    return m_id.group(1).strip(), m_res.group(1).strip()
+
+
+def _extract_clean_error_log_entry(line: str) -> tuple[str, str] | None:
+    prefix = line.split("\t", 1)[0]
+    m = re.match(r"^([0-9]+)-(https?://.+?)-", prefix)
+    if not m:
+        return None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _find_article_html_by_id(root: Path, article_id: str) -> Path | None:
+    raw_files = sorted(root.rglob(f"{article_id}-*.html"))
+    for p in raw_files:
+        if p.is_file() and not p.name.lower().startswith(CLEAN_HTML_PREFIX.lower()):
+            return p
+    clean_files = sorted(root.rglob(f"{CLEAN_HTML_PREFIX}{article_id}-*.html"))
+    for p in clean_files:
+        if p.is_file():
+            return p
+    return None
+
+
+def _probe_resource_recoverable(
+    session: requests.Session,
+    article_id: str,
+    resource_url: str,
+) -> bool:
+    source_url = f"{BASE_URL}/showweb/0/0/{article_id}.aspx"
+
+    def _try_fetch(one_url: str) -> bool:
+        if not one_url:
+            return False
+        try:
+            request_with_retry(
+                session,
+                one_url,
+                headers={
+                    "Referer": source_url,
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Sec-Fetch-Dest": "image",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "cross-site",
+                    "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
+                },
+                timeout=RESOURCE_REQUEST_TIMEOUT,
+                retries=RESOURCE_REQUEST_RETRIES,
+                use_session_cookies=("signature=" not in one_url.lower()),
+                bypass_env_proxy=True,
+            )
+            return True
+        except Exception:
+            return False
+
+    if _try_fetch(resource_url):
+        return True
+
+    try:
+        by_input, by_path = _request_changeurl_signed_images(
+            session, source_url, [resource_url]
+        )
+        fresh = by_input.get(resource_url, "")
+        if not fresh:
+            fresh = by_path.get(_url_path_key(resource_url), "")
+        if fresh and _try_fetch(fresh):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def replay_resource_failures_from_logs(
+    root: Path,
+    session: requests.Session,
+) -> dict[str, int]:
+    stats = {
+        "entries_total": 0,
+        "entries_recoverable": 0,
+        "articles_retried": 0,
+        "articles_recleaned": 0,
+        "lines_removed": 0,
+    }
+
+    log_rows: list[tuple[str, int, str, str, str, str]] = []
+    # (file_key, line_idx, raw_line, parser_kind, article_id, resource_url)
+    file_map = {
+        "not_found": RESOURCES_NOT_FOUND_WARNING_FILE,
+        "clean_error": CLEAN_ERROR_URL_FILE,
+    }
+    parser_map = {
+        "not_found": _extract_not_found_log_entry,
+        "clean_error": _extract_clean_error_log_entry,
+    }
+
+    for key, fp in file_map.items():
+        if not fp.is_file():
+            continue
+        lines = fp.read_text(encoding="utf-8", errors="ignore").splitlines()
+        parser = parser_map[key]
+        for idx, line in enumerate(lines):
+            parsed = parser(line)
+            if not parsed:
+                continue
+            aid, res = parsed
+            if not aid or not res:
+                continue
+            log_rows.append((key, idx, line, key, aid, res))
+
+    stats["entries_total"] = len(log_rows)
+    if not log_rows:
+        return stats
+
+    pair_probe_cache: dict[tuple[str, str], bool] = {}
+    for _, _, _, _, aid, res in log_rows:
+        pair = (aid, res)
+        if pair in pair_probe_cache:
+            continue
+        pair_probe_cache[pair] = _probe_resource_recoverable(session, aid, res)
+
+    recoverable_pairs = {p for p, ok in pair_probe_cache.items() if ok}
+    stats["entries_recoverable"] = len(recoverable_pairs)
+    if not recoverable_pairs:
+        return stats
+
+    recoverable_articles = sorted({aid for aid, _ in recoverable_pairs})
+    recleaned_articles: set[str] = set()
+    for aid in recoverable_articles:
+        fp = _find_article_html_by_id(root, aid)
+        if fp is None:
+            continue
+        stats["articles_retried"] += 1
+        try:
+            st, _ = process_one_article(
+                fp,
+                session,
+                force_clean=True,
+                remove_original=False,
+                r_clean_only=False,
+                gen_docx=False,
+                force_docx=False,
+            )
+        except CleanRateLimitError:
+            raise
+        except Exception as exc:
+            log_warn(f"日志回放复洗失败 art={aid} file={fp.name} err={exc}")
+            continue
+        if st == "processed":
+            recleaned_articles.add(aid)
+
+    stats["articles_recleaned"] = len(recleaned_articles)
+    if not recleaned_articles:
+        return stats
+
+    to_remove: dict[str, set[int]] = {"not_found": set(), "clean_error": set()}
+    for key, idx, _, _, aid, res in log_rows:
+        if aid in recleaned_articles and (aid, res) in recoverable_pairs:
+            to_remove[key].add(idx)
+
+    for key, fp in file_map.items():
+        if not fp.is_file():
+            continue
+        rm = to_remove.get(key) or set()
+        if not rm:
+            continue
+        lines = fp.read_text(encoding="utf-8", errors="ignore").splitlines()
+        kept = [ln for i, ln in enumerate(lines) if i not in rm]
+        fp.write_text(("\n".join(kept) + ("\n" if kept else "")), encoding="utf-8")
+        stats["lines_removed"] += len(rm)
+
+    return stats
 
 
 if __name__ == "__main__":
     raise SystemExit("入口：仓库根 wc-library.py 或 src/wc-library.py（本文件为库模块，不作为主程序）。")
+

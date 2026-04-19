@@ -1,7 +1,8 @@
-"""随笔清洗 HTML 转 Word（.docx）。由 wc-essay 动态加载；主程序为仓库根或 src 下的 wc-essay.py。"""
+"""随笔转换模块：将清洗 HTML 转换为同名 Word（.docx）。由 wc-essay 动态加载。"""
 
 from __future__ import annotations
 
+import importlib.util
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -14,12 +15,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt
 
 # 可选依赖 lxml 作为 BS4 解析器；未安装则回退 html.parser。
-try:
-    import lxml  # noqa: F401
-
-    _BS_PARSER = "lxml"
-except ImportError:
-    _BS_PARSER = "html.parser"
+_BS_PARSER = "lxml" if importlib.util.find_spec("lxml") else "html.parser"
 
 FONT_PT_WUHAO = Pt(10.5)
 LINE_SPACING_FIXED_PT = Pt(20)
@@ -187,7 +183,7 @@ def convert_essay_html_tree_to_docx(
         docx_path = html_path.with_suffix(".docx")
         try:
             if not _docx_needs_regen(
-                html_path, docx_path, force=force, incremental=incremental_docx
+                html_path, docx_path, force=force, incremental=incremental
             ):
                 skipped += 1
                 continue
