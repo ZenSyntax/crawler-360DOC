@@ -60,6 +60,17 @@ def _get_env_positive_int(name: str, default: int) -> int:
     return val if val > 0 else default
 
 
+def _get_env_positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except Exception:
+        return default
+    return val if val > 0 else default
+
+
 RESOURCE_DOWNLOAD_MAX_WORKERS = _get_env_positive_int("DOC360_MAX_WORKERS", 50)
 RESOURCE_MAX_ATTEMPTS_PER_URL = 12
 RESOURCE_MAX_REFRESH_RETRIES = 4
@@ -67,11 +78,38 @@ RESOURCE_PROGRESS_HEARTBEAT_SEC = 8
 INVALID_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 WORD_META_WORDURL_RE = re.compile(r"wordurl\s*=\s*['\"]([^'\"]+)['\"]", re.I)
+WORD_META_WORDCSSURL_RE = re.compile(r"wordCSSUrl\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 WORD_META_PAGENUM_RE = re.compile(r"pageNume\s*=\s*(\d+)", re.I)
 PPT_IMG_ARR_RE = re.compile(r"var\s+pptimgArr\s*=\s*\[(.*?)\]\s*;?", re.I | re.S)
+PDF_IMG_ARR_RE = re.compile(r"var\s+pdfList\s*=\s*\[(.*?)\]\s*;?", re.I | re.S)
 PPT_IMG_URL_RE = re.compile(r"['\"]([^'\"]+)['\"]")
+GER_LOOKING_USER_INFO_RE = re.compile(
+    r"GerLookingUserInfo\s*\((.*?)\)\s*;?", re.I | re.S
+)
+PDF_FIRST_PAGE_URL_RE = re.compile(
+    r"['\"]([^'\"]+?_(\d+)\.(?:jpe?g|png|gif|webp|bmp))['\"]", re.I
+)
+CSS_URL_FUNC_RE = re.compile(r"url\(\s*(['\"]?)([^'\"\)]+)\1\s*\)", re.I)
+HTML_CHARSET_META_RE = re.compile(
+    rb"<meta[^>]+charset\s*=\s*['\"]?\s*([a-zA-Z0-9._-]+)", re.I
+)
 WORD_PREVIEW_PAGE_SLEEP_SEC = (0.25, 0.65)
-MAX_WORD_PREVIEW_PAGES = 200
+WORD_PREVIEW_REQUEST_TIMEOUT = _get_env_positive_float(
+    "DOC360_WORD_PREVIEW_TIMEOUT_SEC", float(RESOURCE_REQUEST_TIMEOUT)
+)
+WORD_PREVIEW_REQUEST_RETRIES = _get_env_positive_int(
+    "DOC360_WORD_PREVIEW_RETRIES", RESOURCE_REQUEST_RETRIES + 1
+) - 1
+WORD_PREVIEW_PROGRESS_EVERY_PAGES = _get_env_positive_int(
+    "DOC360_WORD_PREVIEW_PROGRESS_EVERY", 10
+)
+WORD_PREVIEW_HEARTBEAT_SEC = _get_env_positive_float(
+    "DOC360_WORD_PREVIEW_HEARTBEAT_SEC", 15.0
+)
+WORD_PREVIEW_MAX_CONSECUTIVE_FAILURES = _get_env_positive_int(
+    "DOC360_WORD_PREVIEW_MAX_CONSEC_FAILS", 40
+)
+MAX_WORD_PREVIEW_PAGES = _get_env_positive_int("DOC360_MAX_WORD_PREVIEW_PAGES", 2000)
 
 # clean_ prefix marks cleaned HTML and differentiates it from raw files during scans.
 CLEAN_HTML_PREFIX = "clean_"
@@ -210,13 +248,38 @@ def append_resource_not_found_warning_line(line: str) -> None:
         )
 
 
-def _looks_like_not_found_body(text: str) -> bool:
-    body = (text or "").lower()
+def _looks_like_not_found_body(text: str, *, content_type: str = "") -> bool:
+    body = (text or "").strip().lower()
     if not body:
         return False
-    if re.search(r"\b404\b", body):
+
+    # CSS / JS assets often contain numeric literals like "404"; do not treat that as 404 pages.
+    ct = (content_type or "").lower()
+    looks_like_html = (
+        "<html" in body
+        or "<!doctype" in body
+        or "<body" in body
+        or "<title" in body
+    )
+    if ("text/css" in ct or "javascript" in ct) and not looks_like_html:
+        return False
+
+    compact = re.sub(r"\s+", " ", body)
+    if re.search(r"<title>\s*(404|not found|页面不存在)", compact):
         return True
-    return "not found" in body
+    if re.search(r"\b404\b.{0,48}\b(not\s*found|error|页面|不存在|找不到)\b", compact):
+        return True
+    for k in (
+        "404 not found",
+        "404 page not found",
+        "resource not found",
+        "页面不存在",
+        "您访问的页面不存在",
+        "找不到该页面",
+    ):
+        if k in compact:
+            return True
+    return False
 
 
 def _is_textual_content_type(content_type: str) -> bool:
@@ -240,6 +303,262 @@ def _looks_like_expired_signature_body(text: str) -> bool:
         ("request has expired" in body)
         or ("<code>accessdenied</code>" in body and "expires" in body)
     )
+
+
+def _text_decode_quality_score(text: str) -> int:
+    if not text:
+        return -10_000
+    lower = text.lower()
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    bad_ctrl = len(re.findall(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", text))
+    replacement = text.count("\ufffd")
+    moji = sum(
+        text.count(t)
+        for t in ("锟", "鍛", "鐩", "鎴", "鏄", "銆", "鈥", "锛", "氓", "聽", "芒聙")
+    )
+    angle = text.count("<")
+    if angle < 8 and ("<html" not in lower and "<body" not in lower):
+        return -50_000 - bad_ctrl * 40 - replacement * 30
+    html_bonus = 0
+    if "<html" in lower:
+        html_bonus += 220
+    if "<head" in lower:
+        html_bonus += 120
+    if "<body" in lower:
+        html_bonus += 120
+    if "</" in lower:
+        html_bonus += 80
+    html_bonus += min(400, angle * 2)
+    if angle < 8:
+        html_bonus -= 1000
+    return cjk * 2 - bad_ctrl * 40 - replacement * 30 - moji * 4 + html_bonus
+
+
+def _decode_html_bytes(raw: bytes, preferred_encoding: str | None = None) -> str:
+    if not raw:
+        return ""
+    def _norm_enc(enc: str) -> str:
+        e = (enc or "").strip().lower().replace("_", "-")
+        if e in ("utf8",):
+            return "utf-8"
+        if e in ("gb2312", "gbk"):
+            return "gb18030"
+        return e
+
+    candidates: list[str] = []
+    preferred_norm = _norm_enc(preferred_encoding or "")
+    if preferred_norm:
+        candidates.append(preferred_norm)
+    meta_norm = ""
+    m = HTML_CHARSET_META_RE.search(raw[:4096])
+    if m:
+        try:
+            meta_norm = _norm_enc(m.group(1).decode("ascii", errors="ignore"))
+            if meta_norm:
+                candidates.append(meta_norm)
+        except Exception:
+            pass
+
+    # Strongly trust explicit charset (HTTP / meta) when it decodes strictly and looks like HTML.
+    for enc in [preferred_norm, meta_norm]:
+        if not enc:
+            continue
+        try:
+            txt = raw.decode(enc, errors="strict")
+        except Exception:
+            continue
+        lower = txt.lower()
+        if "<html" in lower or "<!doctype" in lower or "<body" in lower:
+            return txt
+
+    candidates.extend(["utf-8", "gb18030", "gbk", "utf-16"])
+
+    best = ""
+    best_score = -10**9
+    seen: set[str] = set()
+    for enc in candidates:
+        e = (enc or "").strip().lower()
+        if not e or e in seen:
+            continue
+        seen.add(e)
+        try:
+            txt = raw.decode(e)
+        except Exception:
+            txt = raw.decode(e, errors="replace")
+        sc = _text_decode_quality_score(txt)
+        if sc > best_score:
+            best_score = sc
+            best = txt
+    if best:
+        return best
+    return raw.decode("utf-8", errors="replace")
+
+
+def _response_text_html(resp: requests.Response) -> str:
+    enc = (resp.encoding or "").strip().lower()
+    preferred = None if enc in ("", "iso-8859-1", "latin-1") else resp.encoding
+    return _decode_html_bytes(resp.content or b"", preferred_encoding=preferred)
+
+
+def _filename_from_content_disposition(content_disposition: str) -> str:
+    cd = (content_disposition or "").strip()
+    if not cd:
+        return ""
+    m_star = re.search(r"filename\*\s*=\s*([^;]+)", cd, re.I)
+    if m_star:
+        raw = m_star.group(1).strip().strip('"')
+        # RFC 5987: UTF-8''encoded-name
+        if "''" in raw:
+            raw = raw.split("''", 1)[1]
+        raw = unquote(raw)
+        return raw.strip()
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.I)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"filename\s*=\s*([^;]+)", cd, re.I)
+    if m2:
+        return m2.group(1).strip().strip('"')
+    return ""
+
+
+def _suffix_from_document_magic(data: bytes) -> str | None:
+    if not data:
+        return None
+    if data.startswith(b"%PDF-"):
+        return ".pdf"
+    if data.startswith(b"PK\x03\x04"):
+        # OOXML family: docx/pptx/xlsx; preview downloads in this pipeline are commonly docx.
+        return ".docx"
+    if data.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+        # OLE family: doc/ppt/xls; default to doc for word-only alignment.
+        return ".doc"
+    return None
+
+
+def fetch_download_document_url(
+    session: requests.Session, article_id: str, *, source_url: str
+) -> str | None:
+    aid = (article_id or "").strip()
+    if not aid or not aid.isdigit():
+        return None
+    ua = session.headers.get("User-Agent", "Mozilla/5.0")
+    headers = {"Referer": source_url, "User-Agent": ua}
+    info_url = f"http://www.360doc.com/ajax/getdownloadinfo.ashx?articleid={aid}"
+    info_resp = request_with_retry(session, info_url, headers=headers, timeout=TIMEOUT)
+    info = (info_resp.text or "").strip()
+    if info not in {"1", "2"}:
+        return None
+    doc_url = f"http://www.360doc.com/ajax/getdownloaddocument.ashx?articleid={aid}"
+    doc_resp = request_with_retry(session, doc_url, headers=headers, timeout=TIMEOUT)
+    raw = (doc_resp.text or "").strip()
+    if not raw or raw == "-1":
+        return None
+    return raw if raw.startswith(("http://", "https://")) else f"http://{raw}"
+
+
+def download_original_preview_document(
+    session: requests.Session,
+    *,
+    article_id: str,
+    source_url: str,
+    output_base_path: Path,
+) -> Path | None:
+    download_url = fetch_download_document_url(
+        session, article_id, source_url=source_url
+    )
+    if not download_url:
+        return None
+    ua = session.headers.get("User-Agent", "Mozilla/5.0")
+    headers = {"Referer": source_url, "User-Agent": ua}
+    resp = request_with_retry(session, download_url, headers=headers, timeout=TIMEOUT)
+    data = resp.content or b""
+    if not data:
+        return None
+
+    cd_name = _filename_from_content_disposition(
+        resp.headers.get("Content-Disposition", "")
+    )
+    ext = Path(cd_name).suffix.lower() if cd_name else ""
+    if not ext:
+        ext = Path(urlparse(resp.url).path).suffix.lower()
+    if not ext:
+        ext = _suffix_from_document_magic(data) or ".bin"
+
+    out = output_base_path.with_suffix(ext)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    return out
+
+
+def _is_preview_only_article_html(
+    *, soup: BeautifulSoup, raw_html: str, source_url: str
+) -> bool:
+    if extract_body_tag_standard(soup) is not None:
+        return False
+    if parse_word_document_meta(raw_html):
+        return True
+    if parse_pdf_image_urls(raw_html, source_url):
+        return True
+    if parse_ppt_image_urls(raw_html, source_url):
+        return True
+    return False
+
+
+def _is_preview_content_node(node: Tag | None) -> bool:
+    if not isinstance(node, Tag):
+        return False
+    cls = set(node.get("class") or [])
+    return bool(
+        {"word-document-preview", "pdf-document-preview", "ppt-document-preview"} & cls
+    )
+
+
+def _is_preview_clean_html_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return any(
+        k in text
+        for k in (
+            "word-document-preview",
+            "pdf-document-preview",
+            "ppt-document-preview",
+        )
+    )
+
+
+def try_direct_download_preview_document_for_word_only(
+    path: Path,
+    session: requests.Session,
+    *,
+    force: bool,
+) -> tuple[str, Path | None]:
+    article_id = extract_article_id(path)
+    source_url = guess_source_url(path)
+    raw = _decode_html_bytes(path.read_bytes())
+    soup = BeautifulSoup(raw, "html.parser")
+    if not _is_preview_only_article_html(soup=soup, raw_html=raw, source_url=source_url):
+        return "not_preview", None
+    out_base = path.with_suffix("")
+    # Respect incremental mode: if any aligned output already exists, skip.
+    if not force:
+        for ext in (".docx", ".doc", ".pdf", ".ppt", ".pptx"):
+            cand = out_base.with_suffix(ext)
+            if cand.is_file():
+                return "skipped", cand
+    try:
+        saved = download_original_preview_document(
+            session,
+            article_id=article_id,
+            source_url=source_url,
+            output_base_path=out_base,
+        )
+    except Exception as exc:
+        log_warn(f"原文档直下载失败 {path.name}: {exc}")
+        return "failed", None
+    if saved is None:
+        return "failed", None
+    return "processed", saved
 
 
 def _category_dir_id_from_name(article_dir_name: str) -> str:
@@ -345,7 +664,7 @@ def request_with_retry(
             if resp.status_code == 404 or (
                 resp.status_code < 500
                 and _is_textual_content_type(resp_ct)
-                and _looks_like_not_found_body(resp.text)
+                and _looks_like_not_found_body(resp.text, content_type=resp_ct)
             ):
                 raise ResourceNotFoundError(f"resource not found url={url}")
             if resp.status_code in TRANSIENT_GATEWAY_STATUS_CODES:
@@ -418,9 +737,60 @@ def parse_word_document_meta(raw_html: str) -> tuple[str, int] | None:
         return None
     base = m_url.group(1).strip().rstrip("/")
     n = int(m_pages.group(1))
-    if n < 1 or n > MAX_WORD_PREVIEW_PAGES:
+    if n < 1:
         return None
+    if n > MAX_WORD_PREVIEW_PAGES:
+        log_warn(
+            f"Word 预览页数过大，截断为前 {MAX_WORD_PREVIEW_PAGES} 页（原始 {n} 页）"
+        )
+        n = MAX_WORD_PREVIEW_PAGES
     return base, n
+
+
+def parse_word_css_url(raw_html: str, word_base: str) -> str:
+    m_css = WORD_META_WORDCSSURL_RE.search(raw_html or "")
+    if m_css:
+        css_base = (m_css.group(1) or "").strip().rstrip("/")
+        if css_base:
+            return f"{css_base}.css"
+    return f"{word_base}.css"
+
+
+def parse_word_preview_css_urls(
+    *, soup: BeautifulSoup, raw_html: str, source_url: str, word_base: str
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(u: str) -> None:
+        uu = normalize_url(u, source_url)
+        uu = _prefer_working_360doc_image_host(uu)
+        if not is_localizable_url(uu):
+            return
+        if uu in seen:
+            return
+        seen.add(uu)
+        out.append(uu)
+
+    _add(parse_word_css_url(raw_html, word_base))
+    for link in soup.select("link[rel][href]"):
+        if not isinstance(link, Tag):
+            continue
+        rel = " ".join(link.get("rel", [])).lower() if link.get("rel") else ""
+        if "stylesheet" not in rel:
+            continue
+        href = str(link.get("href", "")).strip()
+        if not href:
+            continue
+        hlow = href.lower()
+        if (
+            "docartpage" in hlow
+            or "page_word" in hlow
+            or "wordbase" in hlow
+            or "wordfancy" in hlow
+        ):
+            _add(href)
+    return out
 
 
 def fetch_word_preview_body(
@@ -442,6 +812,11 @@ def fetch_word_preview_body(
     ua = session.headers.get("User-Agent", "Mozilla/5.0")
     headers = {"Referer": source_url, "User-Agent": ua}
     any_page_ok = False
+    ok_pages = 0
+    fail_pages = 0
+    consecutive_failures = 0
+    started_at = time.time()
+    last_heartbeat_at = started_at
 
     for p in range(1, page_count + 1):
         page_url = f"{word_base}_{p}.html"
@@ -449,8 +824,14 @@ def fetch_word_preview_body(
             "div", attrs={"class": "word-preview-page", "data-page": str(p)}
         )
         try:
-            resp = request_with_retry(session, page_url, headers=headers)
-            sub = BeautifulSoup(resp.text, "html.parser")
+            resp = request_with_retry(
+                session,
+                page_url,
+                headers=headers,
+                timeout=int(max(1.0, WORD_PREVIEW_REQUEST_TIMEOUT)),
+                retries=max(0, WORD_PREVIEW_REQUEST_RETRIES),
+            )
+            sub = BeautifulSoup(_response_text_html(resp), "html.parser")
             for bad in sub.select("script,style,noscript,iframe"):
                 bad.decompose()
             src_body = sub.body
@@ -463,16 +844,22 @@ def fetch_word_preview_body(
                     page_div.append(root.extract())
             if page_div.get_text(strip=True) or page_div.find(["img", "a", "table"]):
                 any_page_ok = True
+                ok_pages += 1
+                consecutive_failures = 0
             wrapper.append(page_div)
         except CleanRateLimitError:
             raise
         except ResourceNotFoundError:
+            fail_pages += 1
+            consecutive_failures += 1
             append_resource_not_found_warning_line(
                 f"article_id={article_id}\tarticle={article_title}\tdir={article_dir_name}"
                 f"\tresource={page_url}\tnot_found=1"
             )
             wrapper.append(page_div)
         except Exception as exc:
+            fail_pages += 1
+            consecutive_failures += 1
             log_warn(f"Word 预览页拉取失败 art={article_id} url={page_url} err={exc}")
             append_clean_resource_failure_line(
                 article_id=article_id,
@@ -482,6 +869,31 @@ def fetch_word_preview_body(
                 error=exc,
             )
             wrapper.append(page_div)
+
+        now = time.time()
+        should_log = (
+            p == page_count
+            or p % WORD_PREVIEW_PROGRESS_EVERY_PAGES == 0
+            or (now - last_heartbeat_at) >= WORD_PREVIEW_HEARTBEAT_SEC
+        )
+        if should_log:
+            elapsed = max(0.001, now - started_at)
+            rate = p / elapsed
+            log_info(
+                f"Word 预览进度 art={article_id} {p}/{page_count} "
+                f"ok={ok_pages} fail={fail_pages} rate={rate:.2f}p/s"
+            )
+            last_heartbeat_at = now
+
+        if (
+            WORD_PREVIEW_MAX_CONSECUTIVE_FAILURES > 0
+            and consecutive_failures >= WORD_PREVIEW_MAX_CONSECUTIVE_FAILURES
+        ):
+            log_warn(
+                f"Word 预览连续失败过多，提前终止 art={article_id} "
+                f"consecutive_fail={consecutive_failures} page={p}/{page_count}"
+            )
+            break
         time.sleep(random.uniform(*WORD_PREVIEW_PAGE_SLEEP_SEC))
 
     if not any_page_ok:
@@ -509,6 +921,90 @@ def parse_ppt_image_urls(raw_html: str, source_url: str) -> list[str]:
         seen.add(abs_url)
         out.append(abs_url)
     return out
+
+
+def _collect_urls_from_js_array(block: str, source_url: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for um in PPT_IMG_URL_RE.finditer(block or ""):
+        raw = (um.group(1) or "").strip()
+        if not raw:
+            continue
+        abs_url = normalize_url(raw, source_url)
+        if not is_localizable_url(abs_url):
+            continue
+        abs_url = _prefer_working_360doc_image_host(abs_url)
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        out.append(abs_url)
+    return out
+
+
+def _parse_pdf_urls_from_ger_looking_user_info(
+    raw_html: str, source_url: str
+) -> list[str]:
+    gm = GER_LOOKING_USER_INFO_RE.search(raw_html or "")
+    if not gm:
+        return []
+    args = gm.group(1) or ""
+    page_match = re.search(r",\s*(\d+)\s*,\s*\d+\s*,\s*\d+\s*$", args)
+    first_match = PDF_FIRST_PAGE_URL_RE.search(args)
+    if not page_match or not first_match:
+        return []
+    try:
+        page_count = int(page_match.group(1))
+    except Exception:
+        return []
+    if page_count < 1:
+        return []
+    first_url = (first_match.group(1) or "").strip()
+    if not first_url:
+        return []
+    index = first_match.group(2)
+    first_abs = normalize_url(first_url, source_url)
+    m = re.search(rf"^(.*_){re.escape(index)}(\.[^.?#]+)(.*)$", first_abs, re.I)
+    if not m:
+        return []
+    prefix, suffix, tail = m.group(1), m.group(2), m.group(3)
+    out: list[str] = []
+    for p in range(1, page_count + 1):
+        u = f"{prefix}{p}{suffix}{tail}"
+        if not is_localizable_url(u):
+            continue
+        out.append(_prefer_working_360doc_image_host(u))
+    return out
+
+
+def parse_pdf_image_urls(raw_html: str, source_url: str) -> list[str]:
+    m = PDF_IMG_ARR_RE.search(raw_html or "")
+    if m:
+        urls = _collect_urls_from_js_array(m.group(1) or "", source_url)
+        if urls:
+            return urls
+    return _parse_pdf_urls_from_ger_looking_user_info(raw_html, source_url)
+
+
+def build_pdf_preview_body(pdf_urls: list[str]) -> Tag | None:
+    if not pdf_urls:
+        return None
+    wrapper_soup = BeautifulSoup(
+        '<div class="pdf-document-preview"></div>', "html.parser"
+    )
+    wrapper = wrapper_soup.div
+    if wrapper is None:
+        return None
+    for idx, u in enumerate(pdf_urls, start=1):
+        page_div = wrapper_soup.new_tag(
+            "div", attrs={"class": "pdf-preview-page", "data-page": str(idx)}
+        )
+        img = wrapper_soup.new_tag(
+            "img",
+            attrs={"src": u, "alt": f"pdf-page-{idx}", "data-pdf-page": str(idx)},
+        )
+        page_div.append(img)
+        wrapper.append(page_div)
+    return wrapper
 
 
 def build_ppt_preview_body(ppt_urls: list[str]) -> Tag | None:
@@ -546,11 +1042,19 @@ def resolve_content_node(
     content = extract_body_tag_standard(soup)
     if content is not None:
         return content
+    pdf_urls = parse_pdf_image_urls(raw_html, source_url)
+    pdf_content = build_pdf_preview_body(pdf_urls)
+    if pdf_content is not None:
+        log_info(f"PDF 预览正文 art={article_id} pages={len(pdf_urls)}")
+        return pdf_content
     word_meta = parse_word_document_meta(raw_html)
     if word_meta:
         word_base, page_count = word_meta
         log_info(
             f"Word 预览正文 art={article_id} pages={page_count} base={word_base}"
+        )
+        word_css_urls = parse_word_preview_css_urls(
+            soup=soup, raw_html=raw_html, source_url=source_url, word_base=word_base
         )
         content = fetch_word_preview_body(
             session,
@@ -562,6 +1066,7 @@ def resolve_content_node(
             article_dir_name,
         )
         if content is not None:
+            content["data-word-css-urls"] = "||".join(word_css_urls)
             return content
     ppt_urls = parse_ppt_image_urls(raw_html, source_url)
     ppt_content = build_ppt_preview_body(ppt_urls)
@@ -573,7 +1078,48 @@ def resolve_content_node(
 
 def build_clean_soup(title: str, author: str, publish_date: str, content_node: Tag) -> BeautifulSoup:
     # Build cleaned DOM: article card with title, metadata, and #content body; omit #artContent shell.
-    clean_html = f"""<!doctype html>
+    extra_head_links: list[str] = []
+    is_word_preview = "word-document-preview" in (content_node.get("class") or [])
+    if is_word_preview:
+        raw_urls = str(content_node.get("data-word-css-urls", "")).strip()
+        if raw_urls:
+            for u in raw_urls.split("||"):
+                uu = u.strip()
+                if uu and uu not in extra_head_links:
+                    extra_head_links.append(uu)
+
+    links_html = "\n".join(
+        f'  <link rel="stylesheet" href="{u}" data-doc360-localize="1"/>' for u in extra_head_links
+    )
+    if links_html:
+        links_html = links_html + "\n"
+    if is_word_preview:
+        clean_html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    html,body{{margin:0;padding:0;background:#f3f4f6;overflow-x:hidden;}}
+    body{{box-sizing:border-box;padding:12px 14px;text-align:center;}}
+    .doc360-card{{display:inline-block;vertical-align:top;width:fit-content;max-width:calc(100vw - 28px);margin:0 auto;background:#fff;border-radius:0.5px;box-shadow:0 2px 14px rgba(0,0,0,0.07);padding:18px 22px 22px;box-sizing:border-box;overflow:visible;text-align:left;}}
+    #content{{display:block;width:fit-content;max-width:none;margin:0 auto;padding:0;box-sizing:border-box;text-align:left;}}
+    #content img{{max-width:none;height:auto;display:inline;margin:0;}}
+    .word-document-preview{{display:block;width:fit-content;max-width:none;overflow:visible !important;margin:0 auto !important;padding:0 !important;}}
+    .word-document-preview,.word-preview-page,.pf{{margin-left:auto !important;margin-right:auto !important;}}
+    .word-document-preview .word-preview-page{{display:block;width:fit-content !important;max-width:none !important;margin:0 auto !important;padding:0 !important;border:0 !important;box-shadow:none !important;float:none !important;overflow:visible !important;}}
+    .word-document-preview .word-preview-page:first-child{{margin-top:0 !important;}}
+    .word-document-preview .pf{{float:none !important;margin:0 auto !important;border:0 !important;box-shadow:none !important;}}
+    .word-document-preview .pc,.word-document-preview .c{{border:0 !important;box-shadow:none !important;}}
+  </style>
+{links_html}</head>
+<body>
+  <article class="doc360-card"><div id="content"></div></article>
+</body>
+</html>"""
+    else:
+        clean_html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -588,8 +1134,10 @@ def build_clean_soup(title: str, author: str, publish_date: str, content_node: T
     #content.doc360-main{{width:100%;max-width:100%;box-sizing:border-box;}}
     #content.doc360-main img{{max-width:100%;height:auto;display:block;margin-left:auto;margin-right:auto;}}
     #content.doc360-main table{{max-width:100%;margin:0;}}
+    #content.doc360-main .word-document-preview img{{max-width:none !important;display:inline;margin:0;}}
+    #content.doc360-main .word-document-preview{{overflow:auto;}}
   </style>
-</head>
+{links_html}</head>
 <body>
   <article class="doc360-card">
     <div class="doc360-title"><h1 id="title"></h1></div>
@@ -599,20 +1147,24 @@ def build_clean_soup(title: str, author: str, publish_date: str, content_node: T
 </body>
 </html>"""
     out = BeautifulSoup(clean_html, "html.parser")
-    t_el = out.select_one("#title")
-    if t_el:
-        t_el.string = title
-    a_el = out.select_one("#author")
-    if a_el:
-        a_el.string = author
-    d_el = out.select_one("#date")
-    if d_el:
-        d_el.string = publish_date
+    if not is_word_preview:
+        t_el = out.select_one("#title")
+        if t_el:
+            t_el.string = title
+        a_el = out.select_one("#author")
+        if a_el:
+            a_el.string = author
+        d_el = out.select_one("#date")
+        if d_el:
+            d_el.string = publish_date
     content_target = out.select_one("#content")
     if content_target is None:
         raise ValueError("清洗模板缺少 #content")
     content_copy = BeautifulSoup(str(content_node), "html.parser")
     root_content = content_copy.find(True) or content_copy
+    if isinstance(root_content, Tag):
+        root_content.attrs.pop("data-word-css-url", None)
+        root_content.attrs.pop("data-word-css-urls", None)
     for bad in root_content.select("script,style,iframe,noscript"):
         bad.decompose()
     if isinstance(root_content, Tag) and (root_content.name or "").lower() in ("td", "th"):
@@ -911,6 +1463,18 @@ def _img_download_attr_name(tag: Tag) -> str | None:
 def collect_resource_nodes(soup: BeautifulSoup) -> list[tuple[Tag, str, str]]:
     # Return tuples: (tag, remote-url-attr, localized-path-attr). img always writes localized path to src.
     nodes: list[tuple[Tag, str, str]] = []
+    head = soup.head
+    if isinstance(head, Tag):
+        for link in head.find_all("link", recursive=True):
+            if not isinstance(link, Tag):
+                continue
+            if not link.has_attr("href"):
+                continue
+            rel = " ".join(link.get("rel", [])).lower() if link.get("rel") else ""
+            if "stylesheet" not in rel:
+                continue
+            if str(link.get("data-doc360-localize", "")).strip() == "1":
+                nodes.append((link, "href", "href"))
     root = soup.select_one("#content")
     if root is None:
         return nodes
@@ -991,6 +1555,77 @@ def localize_resources(
     article_title: str,
     article_dir_name: str,
 ) -> ResourceLocalizationResult:
+    def _rewrite_css_and_localize_deps(
+        css_bytes: bytes, css_remote_url: str, css_local_name: str
+    ) -> bytes:
+        css_text = _decode_html_bytes(css_bytes)
+        if not css_text.strip():
+            return css_bytes
+        css_dir = clean_output_path.with_suffix("")
+
+        dep_cache: dict[str, str] = {}
+        dep_seq = 0
+
+        def _repl(m: re.Match[str]) -> str:
+            nonlocal dep_seq
+            quote = m.group(1) or ""
+            raw = (m.group(2) or "").strip()
+            if not raw or raw.startswith(("data:", "#", "javascript:")):
+                return m.group(0)
+            abs_dep = normalize_url(raw, css_remote_url)
+            abs_dep = _prefer_working_360doc_image_host(abs_dep)
+            if not is_localizable_url(abs_dep):
+                return m.group(0)
+            if abs_dep in dep_cache:
+                local_ref = dep_cache[abs_dep]
+                return f"url({quote}{local_ref}{quote})"
+            try:
+                dep_resp = request_with_retry(
+                    session,
+                    abs_dep,
+                    headers={
+                        "Referer": source_url,
+                        "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
+                    },
+                    timeout=RESOURCE_REQUEST_TIMEOUT,
+                    retries=RESOURCE_REQUEST_RETRIES,
+                    use_session_cookies=("signature=" not in abs_dep.lower()),
+                    bypass_env_proxy=True,
+                )
+                dep_data = dep_resp.content or b""
+                if not dep_data:
+                    return m.group(0)
+                dep_ext = suffix_from_url(abs_dep, ".bin")
+                dep_magic = _suffix_from_magic(dep_data)
+                if dep_magic:
+                    dep_ext = dep_magic
+                elif dep_ext in (".bin", ".html", ".css"):
+                    dep_ext = _suffix_from_content_type(
+                        dep_resp.headers.get("content-type", ""),
+                        dep_ext,
+                    )
+                dep_seq += 1
+                dep_name = sanitize_name(
+                    f"res_css_{Path(css_local_name).stem}_{dep_seq}{dep_ext}",
+                    f"res_css_{dep_seq}{dep_ext}",
+                )
+                dep_path = css_dir / dep_name
+                dep_path.write_bytes(dep_data)
+                dep_cache[abs_dep] = dep_name
+                return f"url({quote}{dep_name}{quote})"
+            except Exception as exc:
+                append_clean_resource_failure_line(
+                    article_id=article_id,
+                    article_title=article_title,
+                    article_dir_name=article_dir_name,
+                    resource_url=abs_dep,
+                    error=exc,
+                )
+                return m.group(0)
+
+        new_css = CSS_URL_FUNC_RE.sub(_repl, css_text)
+        return new_css.encode("utf-8", errors="ignore")
+
     resource_nodes = collect_resource_nodes(clean_soup)
     if not resource_nodes:
         return ResourceLocalizationResult(downloaded=0, failed_urls=[])
@@ -1021,7 +1656,10 @@ def localize_resources(
             continue
         unique_urls.append(abs_url)
         file_seq = len(unique_urls)
-        fallback_ext = ".html" if write_attr == "href" else ".bin"
+        if (tag.name or "").lower() == "link":
+            fallback_ext = ".css"
+        else:
+            fallback_ext = ".html" if write_attr == "href" else ".bin"
         url_meta[abs_url] = (file_seq, fallback_ext)
         url_primary_tag[abs_url] = tag
 
@@ -1355,6 +1993,13 @@ def localize_resources(
                 f"res_{seq}{ext}", f"res_{seq}{fallback_ext}"
             )
             local_path = res_dir / local_name
+            primary_tag = url_primary_tag.get(abs_url)
+            if (
+                isinstance(primary_tag, Tag)
+                and (primary_tag.name or "").lower() == "link"
+                and local_name.lower().endswith(".css")
+            ):
+                data = _rewrite_css_and_localize_deps(data, abs_url, local_name)
             local_path.write_bytes(data)
             rel_ref = f"{res_dir.name}/{local_name}"
             url_to_local[abs_url] = rel_ref
@@ -1450,6 +2095,221 @@ def _parse_css_font_size_pt(style: str) -> float | None:
     return None
 
 
+def _parse_css_font_size_pt_value(value: str) -> float | None:
+    m = re.search(r"([\d.]+)\s*(px|pt)\b", value or "", re.I)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "pt":
+        return val
+    if unit == "px":
+        return val * 0.75
+    return None
+
+
+def _css_decl_map(decl_text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in (decl_text or "").split(";"):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        kk = k.strip().lower()
+        vv = v.strip()
+        if kk:
+            out[kk] = vv
+    return out
+
+
+def _clean_font_family_name(raw: str) -> str | None:
+    if not raw:
+        return None
+    first = raw.split(",", 1)[0].strip().strip("\"'")
+    if not first:
+        return None
+    if re.fullmatch(r"ff\d+", first, re.I):
+        return None
+    return first
+
+
+def _apply_css_decl_to_ctx(base: "_RunCtx", decl: dict[str, str]) -> "_RunCtx":
+    ctx = base
+    color = _parse_css_color(decl.get("color", "")) if "color" in decl else None
+    if color is not None:
+        ctx = ctx._replace(color=color)
+    if "font-size" in decl:
+        pt = _parse_css_font_size_pt_value(decl.get("font-size", ""))
+        if pt is not None:
+            ctx = ctx._replace(font_pt=pt)
+    if "font-family" in decl:
+        fam = _clean_font_family_name(decl.get("font-family", ""))
+        if fam:
+            ctx = ctx._replace(font_name=fam)
+    if "font-style" in decl and decl.get("font-style", "").strip().lower() == "italic":
+        ctx = ctx._replace(italic=True)
+    if "font-weight" in decl:
+        fw = decl.get("font-weight", "").strip().lower()
+        if fw == "bold":
+            ctx = ctx._replace(bold=True)
+        else:
+            m_num = re.search(r"\d+", fw)
+            if m_num and int(m_num.group(0)) >= 600:
+                ctx = ctx._replace(bold=True)
+    td = decl.get("text-decoration", "").strip().lower()
+    if td:
+        if "underline" in td:
+            ctx = ctx._replace(underline=True)
+        if "line-through" in td:
+            ctx = ctx._replace(strike=True)
+    return ctx
+
+
+def _get_docx_class_ctx_map() -> dict[str, dict[str, str]]:
+    raw = getattr(_DOCX_TLS, "class_ctx_map", None)
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def _parse_css_len_pt(value: str) -> float | None:
+    m = re.search(r"(-?[\d.]+)\s*(px|pt)\b", value or "", re.I)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "px":
+        return val * 0.75
+    if unit == "pt":
+        return val
+    return None
+
+
+def _node_css_decl(tag: Tag) -> dict[str, str]:
+    out: dict[str, str] = {}
+    class_map = _get_docx_class_ctx_map()
+    for cls in _tag_class_list(tag):
+        decl = class_map.get(cls)
+        if isinstance(decl, dict):
+            out.update(decl)
+    st = str(tag.get("style") or "")
+    if st:
+        out.update(_css_decl_map(st))
+    return out
+
+
+def _apply_node_paragraph_css(p, tag: Tag) -> None:
+    decl = _node_css_decl(tag)
+    ta = (decl.get("text-align") or "").strip().lower()
+    if ta == "center":
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif ta == "right":
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    elif ta == "justify":
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    elif ta == "left":
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    pf = p.paragraph_format
+    left_pt = None
+    for k in ("margin-left", "padding-left"):
+        v = decl.get(k)
+        if not v:
+            continue
+        vv = _parse_css_len_pt(v)
+        if vv is None:
+            continue
+        if left_pt is None or vv > left_pt:
+            left_pt = vv
+    if left_pt is not None and left_pt > 0:
+        pf.left_indent = Pt(left_pt)
+
+    ti = decl.get("text-indent")
+    if ti:
+        ti_pt = _parse_css_len_pt(ti)
+        if ti_pt is not None:
+            pf.first_line_indent = Pt(ti_pt)
+
+
+def _is_preview_image_tag(img: Tag) -> bool:
+    if not isinstance(img, Tag):
+        return False
+    cls = set(_tag_class_list(img))
+    if "bi" in cls:
+        return True
+    alt = str(img.get("alt", "")).lower()
+    if alt.startswith("pdf-page-") or alt.startswith("ppt-page-"):
+        return True
+    for p in img.parents:
+        if not isinstance(p, Tag):
+            continue
+        c = set(_tag_class_list(p))
+        if {
+            "word-preview-page",
+            "pdf-preview-page",
+            "ppt-preview-page",
+            "word-document-preview",
+            "pdf-document-preview",
+            "ppt-document-preview",
+        } & c:
+            return True
+    return False
+
+
+def _nearest_word_preview_page(tag: Tag) -> Tag | None:
+    for p in tag.parents:
+        if not isinstance(p, Tag):
+            continue
+        cls = set(_tag_class_list(p))
+        if "word-preview-page" in cls:
+            return p
+    return None
+
+
+def _word_preview_page_has_text(page: Tag) -> bool:
+    for t in page.find_all(class_="t"):
+        if not isinstance(t, Tag):
+            continue
+        if t.get_text("", strip=True):
+            return True
+    return False
+
+
+def _is_word_preview_background_image(img: Tag) -> bool:
+    cls = set(_tag_class_list(img))
+    if "bi" not in cls:
+        return False
+    # Typical page background sprite in preview template.
+    if {"x0", "y0", "w1", "h1"}.issubset(cls):
+        return True
+    return False
+
+
+def _should_skip_preview_image_for_docx(img: Tag) -> bool:
+    if not isinstance(img, Tag):
+        return False
+    if not _is_word_preview_background_image(img):
+        return False
+    page = _nearest_word_preview_page(img)
+    if page is None:
+        return False
+    return _word_preview_page_has_text(page)
+
+
+def _image_width_for_docx(img: Tag, default_width: Inches = Inches(5.5)):
+    decl = _node_css_decl(img)
+    w = decl.get("width", "")
+    pt = _parse_css_len_pt(w)
+    if pt is None:
+        return default_width
+    inches = pt / 72.0
+    # Clamp to a practical page width range.
+    if inches < 0.5:
+        inches = 0.5
+    if inches > 7.0:
+        inches = 7.0
+    return Inches(inches)
+
+
 def _set_run_east_asia(run, font_name: str) -> None:
     run.font.name = font_name
     r = run._element.rPr
@@ -1526,6 +2386,7 @@ class _RunCtx(NamedTuple):
 
 
 _LINK_BLUE = RGBColor(0x05, 0x63, 0xC1)
+_DOCX_TLS = threading.local()
 
 
 def _rgb_word_hex(rgb: RGBColor) -> str:
@@ -1552,19 +2413,23 @@ def _apply_ctx_to_run(run, ctx: _RunCtx, default_pt: Pt) -> None:
 
 
 def _span_ctx_from_tag(tag: Tag, base: _RunCtx) -> _RunCtx:
+    ctx = base
+    class_map = _get_docx_class_ctx_map()
+    for cls in _tag_class_list(tag):
+        decl = class_map.get(cls)
+        if isinstance(decl, dict):
+            ctx = _apply_css_decl_to_ctx(ctx, decl)
+
     st = str(tag.get("style") or "")
-    c = _parse_css_color(st)
-    fs = _parse_css_font_size_pt(st)
-    if c is None and tag.has_attr("color"):
+    if st:
+        ctx = _apply_css_decl_to_ctx(ctx, _css_decl_map(st))
+
+    if tag.has_attr("color"):
         co = str(tag.get("color", ""))
-        if co.startswith("#"):
-            c = _parse_css_color(co)
-    if c is not None or fs is not None:
-        return base._replace(
-            color=c if c is not None else base.color,
-            font_pt=fs if fs is not None else base.font_pt,
-        )
-    return base
+        c = _parse_css_color(co)
+        if c is not None:
+            ctx = ctx._replace(color=c)
+    return ctx
 
 
 def _append_ox_text_run(
@@ -1651,6 +2516,7 @@ def _walk_inline_to_hyperlink_ox(
     if not isinstance(node, Tag):
         return
     name = (node.name or "").lower()
+    node_ctx = _span_ctx_from_tag(node, ctx)
     if name == "br":
         if br_state[0]:
             return
@@ -1662,7 +2528,7 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(bold=True),
+                node_ctx._replace(bold=True),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
@@ -1673,7 +2539,7 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(italic=True),
+                node_ctx._replace(italic=True),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
@@ -1684,7 +2550,7 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(underline=True),
+                node_ctx._replace(underline=True),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
@@ -1695,7 +2561,7 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(strike=True),
+                node_ctx._replace(strike=True),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
@@ -1706,7 +2572,7 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(subscript=True, superscript=False),
+                node_ctx._replace(subscript=True, superscript=False),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
@@ -1717,17 +2583,21 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(superscript=True, subscript=False),
+                node_ctx._replace(superscript=True, subscript=False),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
             )
         return
     if name in ("span", "font"):
-        nc = _span_ctx_from_tag(node, ctx)
         for ch in node.children:
             _walk_inline_to_hyperlink_ox(
-                h_el, ch, nc, default_pt, link_style=link_style, br_state=br_state
+                h_el,
+                ch,
+                node_ctx,
+                default_pt,
+                link_style=link_style,
+                br_state=br_state,
             )
         return
     if name in ("code",):
@@ -1735,7 +2605,7 @@ def _walk_inline_to_hyperlink_ox(
             _walk_inline_to_hyperlink_ox(
                 h_el,
                 ch,
-                ctx._replace(font_name="Consolas"),
+                node_ctx._replace(font_name="Consolas"),
                 default_pt,
                 link_style=link_style,
                 br_state=br_state,
@@ -1743,7 +2613,7 @@ def _walk_inline_to_hyperlink_ox(
         return
     for ch in node.children:
         _walk_inline_to_hyperlink_ox(
-            h_el, ch, ctx, default_pt, link_style=link_style, br_state=br_state
+            h_el, ch, node_ctx, default_pt, link_style=link_style, br_state=br_state
         )
 
 
@@ -1887,6 +2757,8 @@ def _add_inline_image_to_paragraph(
     article_clean_html: Path | None = None,
     br_state: list[bool] | None = None,
 ) -> None:
+    if _should_skip_preview_image_for_docx(img):
+        return
     if br_state is not None:
         br_state[0] = False
     src = _img_src_for_local_resolve(img)
@@ -1895,7 +2767,9 @@ def _add_inline_image_to_paragraph(
     )
     if local and local.is_file():
         try:
-            _add_picture_top_bottom_wrap(paragraph, str(local), Inches(5.5))
+            _add_picture_top_bottom_wrap(
+                paragraph, str(local), _image_width_for_docx(img)
+            )
         except Exception as exc:
             log_warn(f"插入图片失败 {local}: {_exc_brief(exc)}")
             r2 = paragraph.add_run(f"[鍥剧墖 {src}]")
@@ -1968,6 +2842,7 @@ def _walk_inline_to_paragraph(
     if not isinstance(node, Tag):
         return
     name = (node.name or "").lower()
+    node_ctx = _span_ctx_from_tag(node, ctx)
     if name == "br":
         if br_state[0]:
             return
@@ -1992,27 +2867,27 @@ def _walk_inline_to_paragraph(
         return
     if name in ("strong", "b"):
         for ch in node.children:
-            _w(ch, ctx._replace(bold=True))
+            _w(ch, node_ctx._replace(bold=True))
         return
     if name in ("em", "i"):
         for ch in node.children:
-            _w(ch, ctx._replace(italic=True))
+            _w(ch, node_ctx._replace(italic=True))
         return
     if name == "u":
         for ch in node.children:
-            _w(ch, ctx._replace(underline=True))
+            _w(ch, node_ctx._replace(underline=True))
         return
     if name in ("s", "strike", "del"):
         for ch in node.children:
-            _w(ch, ctx._replace(strike=True))
+            _w(ch, node_ctx._replace(strike=True))
         return
     if name == "sub":
         for ch in node.children:
-            _w(ch, ctx._replace(subscript=True, superscript=False))
+            _w(ch, node_ctx._replace(subscript=True, superscript=False))
         return
     if name == "sup":
         for ch in node.children:
-            _w(ch, ctx._replace(superscript=True, subscript=False))
+            _w(ch, node_ctx._replace(superscript=True, subscript=False))
         return
     if name == "a":
         href = str(node.get("href") or "").strip()
@@ -2029,7 +2904,7 @@ def _walk_inline_to_paragraph(
         if is_local_image_href:
             if node.find("img"):
                 for ch in node.children:
-                    _w(ch, ctx)
+                    _w(ch, node_ctx)
                 return
             key = href.replace("\\", "/")
             if local_media_href_dedupe is not None and key in local_media_href_dedupe:
@@ -2051,24 +2926,23 @@ def _walk_inline_to_paragraph(
             ("javascript:", "mailto:", "tel:")
         ):
             _paragraph_add_external_hyperlink(
-                paragraph, href, node, ctx, default_pt, br_state=br_state
+                paragraph, href, node, node_ctx, default_pt, br_state=br_state
             )
         else:
             for ch in node.children:
-                _w(ch, ctx)
+                _w(ch, node_ctx)
         return
     if name in ("span", "font"):
-        nc = _span_ctx_from_tag(node, ctx)
         for ch in node.children:
-            _w(ch, nc)
+            _w(ch, node_ctx)
         return
     if name in ("code",):
         for ch in node.children:
-            _w(ch, ctx._replace(font_name="Consolas"))
+            _w(ch, node_ctx._replace(font_name="Consolas"))
         return
     if name in ("mark",):
         for ch in node.children:
-            _w(ch, ctx)
+            _w(ch, node_ctx)
         return
     if name in ("p", "div", "section", "article", "header", "footer", "center"):
         if "word-preview-page" in _tag_class_list(node):
@@ -2084,10 +2958,10 @@ def _walk_inline_to_paragraph(
                         )
             return
         for ch in node.children:
-            _w(ch, ctx)
+            _w(ch, node_ctx)
         return
     for ch in node.children:
-        _w(ch, ctx)
+        _w(ch, node_ctx)
 
 
 def _img_src_for_local_resolve(img: Tag) -> str:
@@ -2192,13 +3066,15 @@ def _append_centered_picture_to_paragraph(
     *,
     article_clean_html: Path | None,
 ) -> None:
+    if _should_skip_preview_image_for_docx(im):
+        return
     src = _img_src_for_local_resolve(im)
     local = _resolve_local_media_path(
         src, base_dir, article_clean_html=article_clean_html
     )
     if local and local.is_file():
         try:
-            _add_picture_top_bottom_wrap(p, str(local), Inches(5.5))
+            _add_picture_top_bottom_wrap(p, str(local), _image_width_for_docx(im))
         except Exception as exc:
             log_warn(f"插入图片失败 {local}: {_exc_brief(exc)}")
             r2 = p.add_run(f"[鍥剧墖 {src}]")
@@ -2231,7 +3107,7 @@ def _fill_paragraph_with_media(
                     href, base_dir, article_clean_html=article_clean_html
                 )
                 if local and local.is_file():
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     _apply_body_paragraph_format(p)
                     try:
                         _add_picture_top_bottom_wrap(p, str(local), Inches(5.5))
@@ -2240,7 +3116,7 @@ def _fill_paragraph_with_media(
                         r2 = p.add_run(f"[鍥剧墖 {href}]")
                         _set_run_east_asia(r2, "绛夌嚎")
                     return
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         _apply_body_paragraph_format(p)
         run = p.add_run(tag.get_text(strip=True) or "[濯掍綋]")
         _set_run_east_asia(run, "绛夌嚎")
@@ -2248,21 +3124,21 @@ def _fill_paragraph_with_media(
         return
 
     if len(imgs) > 1 and new_paragraph is not None:
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT if _is_preview_image_tag(imgs[0]) else WD_ALIGN_PARAGRAPH.CENTER
         _apply_body_paragraph_format(p)
         _append_centered_picture_to_paragraph(
             p, imgs[0], base_dir, article_clean_html=article_clean_html
         )
         for im in imgs[1:]:
             np = new_paragraph()
-            np.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            np.alignment = WD_ALIGN_PARAGRAPH.LEFT if _is_preview_image_tag(im) else WD_ALIGN_PARAGRAPH.CENTER
             _apply_body_paragraph_format(np)
             _append_centered_picture_to_paragraph(
                 np, im, base_dir, article_clean_html=article_clean_html
             )
         return
 
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT if _is_preview_image_tag(imgs[0]) else WD_ALIGN_PARAGRAPH.CENTER
     _apply_body_paragraph_format(p)
     for im in imgs:
         _append_centered_picture_to_paragraph(
@@ -2569,19 +3445,73 @@ def _emit_content_node(
         return
     if name == "br":
         return
-    wprev = node.select_one(".word-document-preview")
-    if wprev is not None:
-        for img in wprev.find_all("img"):
+    cls = _tag_class_list(node)
+    base_inline_ctx = _span_ctx_from_tag(node, _RunCtx())
+    if "t" in cls:
+        tp = doc.add_paragraph()
+        _apply_node_paragraph_css(tp, node)
+        for ch in node.children:
+            _walk_inline_to_paragraph(
+                tp,
+                ch,
+                base_inline_ctx,
+                DEFAULT_BODY_PT,
+                base_dir=base_dir,
+                article_clean_html=article_clean_html,
+            )
+        return
+    if "word-document-preview" in cls:
+        # Specialized preview template: preserve both text and media by walking pages.
+        for ch in node.children:
+            if isinstance(ch, NavigableString):
+                if str(ch).strip():
+                    bp = doc.add_paragraph()
+                    _walk_inline_to_paragraph(
+                        bp,
+                        ch,
+                        base_inline_ctx,
+                        DEFAULT_BODY_PT,
+                        base_dir=base_dir,
+                        article_clean_html=article_clean_html,
+                    )
+            elif isinstance(ch, Tag):
+                _emit_content_node(
+                    doc,
+                    ch,
+                    base_dir,
+                    list_level=list_level,
+                    article_clean_html=article_clean_html,
+                )
+        return
+    if "pdf-document-preview" in cls or "ppt-document-preview" in cls:
+        for img in node.find_all("img"):
             if isinstance(img, Tag):
+                if _should_skip_preview_image_for_docx(img):
+                    continue
                 _add_media_paragraph(
                     doc, img, base_dir, article_clean_html=article_clean_html
                 )
         return
-    if name in ("div", "section") and "word-preview-page" in _tag_class_list(node):
-        for img in node.find_all("img"):
-            if isinstance(img, Tag):
-                _add_media_paragraph(
-                    doc, img, base_dir, article_clean_html=article_clean_html
+    if name in ("div", "section") and "word-preview-page" in cls:
+        for ch in node.children:
+            if isinstance(ch, NavigableString):
+                if str(ch).strip():
+                    bp = doc.add_paragraph()
+                    _walk_inline_to_paragraph(
+                        bp,
+                        ch,
+                        base_inline_ctx,
+                        DEFAULT_BODY_PT,
+                        base_dir=base_dir,
+                        article_clean_html=article_clean_html,
+                    )
+            elif isinstance(ch, Tag):
+                _emit_content_node(
+                    doc,
+                    ch,
+                    base_dir,
+                    list_level=list_level,
+                    article_clean_html=article_clean_html,
                 )
         return
     if name in _BLOCK_UNWRAP:
@@ -2592,7 +3522,7 @@ def _emit_content_node(
                     _walk_inline_to_paragraph(
                         bp,
                         ch,
-                        _RunCtx(),
+                        base_inline_ctx,
                         DEFAULT_BODY_PT,
                         base_dir=base_dir,
                         article_clean_html=article_clean_html,
@@ -2619,7 +3549,7 @@ def _emit_content_node(
             _walk_inline_to_paragraph(
                 hp,
                 ch,
-                _RunCtx(),
+                base_inline_ctx,
                 DEFAULT_BODY_PT,
                 base_dir=base_dir,
                 article_clean_html=article_clean_html,
@@ -2665,7 +3595,7 @@ def _emit_content_node(
                     _walk_inline_to_paragraph(
                         bp,
                         ch,
-                        _RunCtx(),
+                        base_inline_ctx,
                         DEFAULT_BODY_PT,
                         base_dir=base_dir,
                         article_clean_html=article_clean_html,
@@ -2691,7 +3621,7 @@ def _emit_content_node(
                         _walk_inline_to_paragraph(
                             bp,
                             c2,
-                            _RunCtx(),
+                            base_inline_ctx,
                             DEFAULT_BODY_PT,
                             base_dir=base_dir,
                             article_clean_html=article_clean_html,
@@ -2702,7 +3632,7 @@ def _emit_content_node(
                     _walk_inline_to_paragraph(
                         bp,
                         ch,
-                        _RunCtx(),
+                        base_inline_ctx,
                         DEFAULT_BODY_PT,
                         base_dir=base_dir,
                         article_clean_html=article_clean_html,
@@ -2726,13 +3656,45 @@ def _emit_content_node(
                     _walk_inline_to_paragraph(
                         fp,
                         c2,
-                        _RunCtx(),
+                        base_inline_ctx,
                         META_PT,
                         base_dir=base_dir,
                         article_clean_html=article_clean_html,
                     )
         return
     if name in ("p", "div", "section"):
+        has_block_child = any(
+            isinstance(ch, Tag)
+            and (
+                (ch.name or "").lower()
+                in ("div", "p", "section", "ul", "ol", "table", "blockquote", "figure")
+            )
+            for ch in node.children
+        )
+        if has_block_child:
+            for ch in node.children:
+                if isinstance(ch, NavigableString):
+                    if str(ch).strip():
+                        bp = doc.add_paragraph()
+                        _apply_node_paragraph_css(bp, node)
+                        _walk_inline_to_paragraph(
+                            bp,
+                            ch,
+                            base_inline_ctx,
+                            DEFAULT_BODY_PT,
+                            base_dir=base_dir,
+                            article_clean_html=article_clean_html,
+                        )
+                    continue
+                if isinstance(ch, Tag):
+                    _emit_content_node(
+                        doc,
+                        ch,
+                        base_dir,
+                        list_level=list_level,
+                        article_clean_html=article_clean_html,
+                    )
+            return
         if node.find(["img", "video", "audio"]):
             seen_media_keys: set[str] = set()
             for sub in node.children:
@@ -2763,10 +3725,11 @@ def _emit_content_node(
                                 )
                         continue
                     bp = doc.add_paragraph()
+                    _apply_node_paragraph_css(bp, sub if isinstance(sub, Tag) else node)
                     _walk_inline_to_paragraph(
                         bp,
                         sub,
-                        _RunCtx(),
+                        base_inline_ctx,
                         DEFAULT_BODY_PT,
                         base_dir=base_dir,
                         article_clean_html=article_clean_html,
@@ -2774,21 +3737,23 @@ def _emit_content_node(
                     )
                 elif isinstance(sub, NavigableString) and str(sub).strip():
                     bp = doc.add_paragraph()
+                    _apply_node_paragraph_css(bp, node)
                     _walk_inline_to_paragraph(
                         bp,
                         sub,
-                        _RunCtx(),
+                        base_inline_ctx,
                         DEFAULT_BODY_PT,
                         base_dir=base_dir,
                         article_clean_html=article_clean_html,
                     )
             return
         bp = doc.add_paragraph()
+        _apply_node_paragraph_css(bp, node)
         for ch in node.children:
             _walk_inline_to_paragraph(
                 bp,
                 ch,
-                _RunCtx(),
+                base_inline_ctx,
                 DEFAULT_BODY_PT,
                 base_dir=base_dir,
                 article_clean_html=article_clean_html,
@@ -2804,7 +3769,7 @@ def _emit_content_node(
             _walk_inline_to_paragraph(
                 bp,
                 ch,
-                _RunCtx(),
+                base_inline_ctx,
                 DEFAULT_BODY_PT,
                 base_dir=base_dir,
                 article_clean_html=article_clean_html,
@@ -2815,11 +3780,98 @@ def _emit_content_node(
         _walk_inline_to_paragraph(
             bp,
             ch,
-            _RunCtx(),
+            base_inline_ctx,
             DEFAULT_BODY_PT,
             base_dir=base_dir,
             article_clean_html=article_clean_html,
         )
+
+
+_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+_CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
+
+
+def _read_local_css_for_docx(clean_html_path: Path, href: str) -> str:
+    raw = (href or "").strip()
+    if not raw or raw.startswith(("http://", "https://", "data:")):
+        return ""
+    base = clean_html_path.parent
+    cand = (base / raw).resolve()
+    if cand.is_file():
+        return cand.read_text(encoding="utf-8", errors="ignore")
+    bare = Path(raw.replace("\\", "/")).name
+    if not bare:
+        return ""
+    rd = clean_html_path.with_suffix("")
+    cand2 = (rd / bare).resolve()
+    if cand2.is_file():
+        return cand2.read_text(encoding="utf-8", errors="ignore")
+    return ""
+
+
+def _build_docx_class_ctx_map(soup: BeautifulSoup, clean_html_path: Path) -> dict[str, dict[str, str]]:
+    chunks: list[str] = []
+    for st in soup.find_all("style"):
+        if isinstance(st, Tag):
+            txt = st.get_text("\n", strip=False)
+            if txt:
+                chunks.append(txt)
+    for lk in soup.find_all("link"):
+        if not isinstance(lk, Tag):
+            continue
+        rel = " ".join(lk.get("rel") or []).lower()
+        if "stylesheet" not in rel:
+            continue
+        href = str(lk.get("href") or "").strip()
+        if not href:
+            continue
+        css_txt = _read_local_css_for_docx(clean_html_path, href)
+        if css_txt:
+            chunks.append(css_txt)
+
+    out: dict[str, dict[str, str]] = {}
+    for css in chunks:
+        css2 = _CSS_COMMENT_RE.sub("", css or "")
+        for m in _CSS_RULE_RE.finditer(css2):
+            selector_group = (m.group(1) or "").strip()
+            decl = _css_decl_map(m.group(2) or "")
+            if not decl:
+                continue
+            filtered = {
+                k: v
+                for k, v in decl.items()
+                if k
+                in {
+                    "color",
+                    "font-size",
+                    "font-family",
+                    "font-style",
+                    "font-weight",
+                    "text-decoration",
+                    "text-align",
+                    "text-indent",
+                    "margin-left",
+                    "padding-left",
+                    "width",
+                }
+            }
+            if not filtered:
+                continue
+            for raw_sel in selector_group.split(","):
+                sel = raw_sel.strip()
+                if not sel.startswith("."):
+                    continue
+                # Keep simple single-class selectors only, e.g. ".fs1", ".fc0".
+                if any(ch in sel for ch in " >+~:#["):
+                    continue
+                mm = re.fullmatch(r"\.([A-Za-z_][\w-]*)", sel)
+                if not mm:
+                    continue
+                cls = mm.group(1)
+                prev = out.get(cls, {})
+                prev.update(filtered)
+                out[cls] = prev
+    return out
 
 
 def convert_clean_html_file_to_docx(
@@ -2832,61 +3884,69 @@ def convert_clean_html_file_to_docx(
         return False
     text = clean_html_path.read_text(encoding="utf-8", errors="replace")
     soup = BeautifulSoup(text, "html.parser")
-    title_el = soup.select_one("#title")
-    title = title_el.get_text(strip=True) if title_el else "无标题"
-    author_el = soup.select_one("#author")
-    author = author_el.get_text(strip=True) if author_el else ""
-    date_el = soup.select_one("#date")
-    pub = date_el.get_text(strip=True) if date_el else ""
-    content = soup.select_one("#content")
-    if content is None:
-        raise ValueError("清洗 HTML 缺少 #content")
+    _DOCX_TLS.class_ctx_map = _build_docx_class_ctx_map(soup, clean_html_path)
+    try:
+        title_el = soup.select_one("#title")
+        if title_el:
+            title = title_el.get_text(strip=True)
+        elif soup.title:
+            title = soup.title.get_text(" ", strip=True)
+        else:
+            title = "无标题"
+        author_el = soup.select_one("#author")
+        author = author_el.get_text(strip=True) if author_el else ""
+        date_el = soup.select_one("#date")
+        pub = date_el.get_text(strip=True) if date_el else ""
+        content = soup.select_one("#content")
+        if content is None:
+            raise ValueError("清洗 HTML 缺少 #content")
 
-    doc = Document()
-    _init_doc_typography(doc)
-    base_dir = clean_html_path.parent
+        doc = Document()
+        _init_doc_typography(doc)
+        base_dir = clean_html_path.parent
 
-    tp = doc.add_paragraph()
-    tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    tr = tp.add_run(title)
-    _set_run_east_asia(tr, "黑体")
-    tr.font.size = TITLE_PT
-    tr.bold = False
+        tp = doc.add_paragraph()
+        tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        tr = tp.add_run(title)
+        _set_run_east_asia(tr, "黑体")
+        tr.font.size = TITLE_PT
+        tr.bold = False
 
-    mp = doc.add_paragraph()
-    mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    meta_line = "  ".join(x for x in (author, pub) if x)
-    mr = mp.add_run(meta_line or " ")
-    _set_run_east_asia(mr, "宋体")
-    mr.font.size = META_PT
+        mp = doc.add_paragraph()
+        mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        meta_line = "  ".join(x for x in (author, pub) if x)
+        mr = mp.add_run(meta_line or " ")
+        _set_run_east_asia(mr, "宋体")
+        mr.font.size = META_PT
 
-    for child in list(content.children):
-        if isinstance(child, NavigableString):
-            if str(child).strip():
-                bp = doc.add_paragraph()
-                _walk_inline_to_paragraph(
-                    bp,
+        for child in list(content.children):
+            if isinstance(child, NavigableString):
+                if str(child).strip():
+                    bp = doc.add_paragraph()
+                    _walk_inline_to_paragraph(
+                        bp,
+                        child,
+                        _RunCtx(),
+                        DEFAULT_BODY_PT,
+                        base_dir=base_dir,
+                        article_clean_html=clean_html_path,
+                    )
+                continue
+            if isinstance(child, Tag):
+                _emit_content_node(
+                    doc,
                     child,
-                    _RunCtx(),
-                    DEFAULT_BODY_PT,
-                    base_dir=base_dir,
+                    base_dir,
+                    list_level=0,
                     article_clean_html=clean_html_path,
                 )
-            continue
-        if isinstance(child, Tag):
-            _emit_content_node(
-                doc,
-                child,
-                base_dir,
-                list_level=0,
-                article_clean_html=clean_html_path,
-            )
 
-    _apply_body_paragraph_format_to_all(doc)
-    _remove_empty_paragraphs(doc)
-
-    doc.save(str(docx_path))
-    return True
+        _apply_body_paragraph_format_to_all(doc)
+        _remove_empty_paragraphs(doc)
+        doc.save(str(docx_path))
+        return True
+    finally:
+        _DOCX_TLS.class_ctx_map = {}
 
 
 def docx_path_for_article_html(raw_html_path: Path) -> Path:
@@ -2947,6 +4007,16 @@ def process_one_article(
             return "failed", False
         if clean_path.is_file():
             try:
+                if raw_path.is_file() and _is_preview_clean_html_file(clean_path):
+                    st, saved = try_direct_download_preview_document_for_word_only(
+                        raw_path, session, force=force_docx
+                    )
+                    if st in {"processed", "skipped"} and saved is not None:
+                        log_info(f"[原文档] {saved}")
+                        _remove_article_sidecars(raw_path)
+                        if raw_path.is_file():
+                            raw_path.unlink(missing_ok=True)
+                        return "processed", False
                 if convert_clean_html_file_to_docx(
                     clean_path, docx_path, force=force_docx
                 ):
@@ -2965,7 +4035,7 @@ def process_one_article(
             if not src_html.is_file():
                 log_warn(f"--r-c 无可用 HTML（缺 raw 与 clean）: {path.name}")
                 return "failed", False
-            text = src_html.read_text(encoding="utf-8", errors="ignore")
+            text = _decode_html_bytes(src_html.read_bytes())
             soup = BeautifulSoup(text, "html.parser")
             title, author, publish_date = extract_article_meta(soup)
             article_title = title or raw_path.stem
@@ -3001,6 +4071,19 @@ def process_one_article(
                 tmp_clean.write_text(str(clean_soup), encoding="utf-8")
                 if rs.downloaded > 0:
                     time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
+                if _is_preview_content_node(content):
+                    saved = download_original_preview_document(
+                        session,
+                        article_id=article_id,
+                        source_url=source_url,
+                        output_base_path=raw_path.with_suffix(""),
+                    )
+                    if saved is not None:
+                        log_info(f"[原文档] {saved}")
+                        _remove_article_sidecars(raw_path)
+                        if raw_path.is_file():
+                            raw_path.unlink(missing_ok=True)
+                        return "processed", False
                 if convert_clean_html_file_to_docx(
                     tmp_clean, docx_path, force=True
                 ):
@@ -3025,6 +4108,15 @@ def process_one_article(
     if not force_clean and clean_path.is_file():
         if gen_docx:
             try:
+                if raw_path.is_file() and _is_preview_clean_html_file(clean_path):
+                    st, saved = try_direct_download_preview_document_for_word_only(
+                        raw_path, session, force=force_docx
+                    )
+                    if st in {"processed", "skipped"} and saved is not None:
+                        log_info(f"[原文档] {saved}")
+                        if remove_original and raw_path.is_file():
+                            raw_path.unlink(missing_ok=True)
+                        return "processed", False
                 if convert_clean_html_file_to_docx(
                     clean_path, docx_path, force=force_docx
                 ):
@@ -3041,7 +4133,7 @@ def process_one_article(
         if not src_html.is_file():
             log_warn(f"无可用 HTML: {path.name}")
             return "failed", False
-        text = src_html.read_text(encoding="utf-8", errors="ignore")
+        text = _decode_html_bytes(src_html.read_bytes())
         soup = BeautifulSoup(text, "html.parser")
         title, author, publish_date = extract_article_meta(soup)
         article_title = title or raw_path.stem
@@ -3080,6 +4172,16 @@ def process_one_article(
             raw_path.unlink(missing_ok=True)
         if gen_docx:
             try:
+                if _is_preview_content_node(content):
+                    saved = download_original_preview_document(
+                        session,
+                        article_id=article_id,
+                        source_url=source_url,
+                        output_base_path=raw_path.with_suffix(""),
+                    )
+                    if saved is not None:
+                        log_info(f"[原文档] {saved}")
+                        return "processed", wrote
                 if convert_clean_html_file_to_docx(
                     clean_path, docx_path, force=force_docx
                 ):
@@ -3115,7 +4217,7 @@ def docx_from_raw_html_via_temp(
     source_url = guess_source_url(path)
     article_dir_name = path.parent.name or "unknown"
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = _decode_html_bytes(path.read_bytes())
         soup = BeautifulSoup(text, "html.parser")
         title, author, publish_date = extract_article_meta(soup)
         article_title = title or path.stem
@@ -3151,6 +4253,18 @@ def docx_from_raw_html_via_temp(
             tmp_clean.write_text(str(clean_soup), encoding="utf-8")
             if rs.downloaded > 0:
                 time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
+            if _is_preview_content_node(content):
+                saved = download_original_preview_document(
+                    session,
+                    article_id=article_id,
+                    source_url=source_url,
+                    output_base_path=path.with_suffix(""),
+                )
+                if saved is not None:
+                    log_info(f"[原文档] {saved}")
+                    if remove_original and path.is_file():
+                        path.unlink(missing_ok=True)
+                    return "processed"
             if convert_clean_html_file_to_docx(tmp_clean, docx_path, force=True):
                 log_info(f"[docx] {docx_path}")
                 if remove_original and path.is_file():
@@ -3181,6 +4295,7 @@ def run_clean_and_word_pass(
     limit: int = 0,
     remove_raw_when_word_only: bool = False,
     clean_article_pacing_sec: tuple[float, float] | None = None,
+    offline_word_only: bool = False,
 ) -> int:
     if not enable_clean and not gen_word:
         return 0
@@ -3204,32 +4319,72 @@ def run_clean_and_word_pass(
     # Local word-only mode: convert existing clean_ HTML directly with max workers.
     if gen_word and not enable_clean and not r_clean_only:
         max_workers = max(1, RESOURCE_DOWNLOAD_MAX_WORKERS)
-        tasks: list[tuple[Path, Path, Path]] = []
+        tasks: list[tuple[str, Path, Path, Path]] = []
         for fp in files:
             raw_fp, clean_fp = article_raw_and_clean_paths(fp)
             docx_path = docx_path_for_article_html(raw_fp)
             if not clean_fp.is_file():
-                log_warn(f"本地 Word 模式跳过（缺 clean 文件）: {raw_fp.name}")
-                skip += 1
+                if raw_fp.is_file() and not offline_word_only:
+                    tasks.append(("preview_download", raw_fp, clean_fp, docx_path))
+                else:
+                    log_warn(f"本地 Word 模式跳过（缺 clean 文件）: {raw_fp.name}")
+                    skip += 1
                 continue
-            tasks.append((raw_fp, clean_fp, docx_path))
+            tasks.append(("clean_to_docx", raw_fp, clean_fp, docx_path))
 
-        def _word_local_worker(item: tuple[Path, Path, Path]) -> tuple[str, Path, Path]:
-            raw_fp, clean_fp, docx_path = item
+        def _word_local_worker(
+            item: tuple[str, Path, Path, Path]
+        ) -> tuple[str, Path, Path | None]:
+            mode, raw_fp, clean_fp, docx_path = item
             try:
-                if convert_clean_html_file_to_docx(clean_fp, docx_path, force=force_docx):
-                    return "processed", raw_fp, docx_path
-                return "skipped", raw_fp, docx_path
+                if mode == "clean_to_docx":
+                    if (
+                        (not offline_word_only)
+                        and raw_fp.is_file()
+                        and _is_preview_clean_html_file(clean_fp)
+                    ):
+                        st, saved = try_direct_download_preview_document_for_word_only(
+                            raw_fp, session, force=force_docx
+                        )
+                        if st == "processed":
+                            return "processed_download", raw_fp, saved
+                        if st == "skipped":
+                            return "skipped", raw_fp, saved
+                    if convert_clean_html_file_to_docx(
+                        clean_fp, docx_path, force=force_docx
+                    ):
+                        return "processed", raw_fp, docx_path
+                    return "skipped", raw_fp, docx_path
+
+                # Fallback for preview-only raw pages: download original doc/pdf/ppt directly.
+                st, saved = try_direct_download_preview_document_for_word_only(
+                    raw_fp, session, force=force_docx
+                )
+                if st == "processed":
+                    return "processed_download", raw_fp, saved
+                if st == "skipped":
+                    return "skipped", raw_fp, saved
+                if st == "not_preview":
+                    log_warn(f"本地 Word 模式跳过（缺 clean 且非预览文档）: {raw_fp.name}")
+                    return "skipped", raw_fp, None
+                return "failed", raw_fp, None
             except Exception as exc:
-                log_warn(f"docx 失败 {clean_fp}: {exc}")
-                return "failed", raw_fp, docx_path
+                log_warn(f"Word 本地处理失败 {raw_fp.name}: {exc}")
+                return "failed", raw_fp, None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = [ex.submit(_word_local_worker, item) for item in tasks]
             for idx, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
-                st, raw_fp, docx_path = fut.result()
+                st, raw_fp, out_path = fut.result()
                 if st == "processed":
-                    log_info(f"[docx] {docx_path}")
+                    if out_path is not None:
+                        log_info(f"[docx] {out_path}")
+                    if remove_raw_when_word_only and raw_fp.is_file():
+                        raw_fp.unlink(missing_ok=True)
+                    ok += 1
+                elif st == "processed_download":
+                    if out_path is not None:
+                        log_info(f"[原文档] {out_path}")
                     if remove_raw_when_word_only and raw_fp.is_file():
                         raw_fp.unlink(missing_ok=True)
                     ok += 1
@@ -3292,6 +4447,20 @@ def run_clean_and_word_pass(
             docx_path = docx_path_for_article_html(raw_fp)
             if clean_fp.is_file():
                 try:
+                    if raw_fp.is_file() and _is_preview_clean_html_file(clean_fp):
+                        st2, saved = try_direct_download_preview_document_for_word_only(
+                            raw_fp, session, force=force_docx
+                        )
+                        if st2 == "processed":
+                            if saved is not None:
+                                log_info(f"[原文档] {saved}")
+                            if remove_raw_when_word_only and raw_fp.is_file():
+                                raw_fp.unlink(missing_ok=True)
+                            ok += 1
+                            continue
+                        if st2 == "skipped":
+                            skip += 1
+                            continue
                     if convert_clean_html_file_to_docx(
                         clean_fp, docx_path, force=force_docx
                     ):

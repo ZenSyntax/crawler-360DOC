@@ -291,6 +291,20 @@ def send_alert_email(
         log_warn(f"告警邮件发送失败 event={event_key} err={exc}")
 
 
+def send_task_completion_email(task_name: str, details: str = "") -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = f"任务已正常完成。\n\ntask={task_name}\nfinished_at={ts}"
+    ext = (details or "").strip()
+    if ext:
+        body += f"\n{ext}"
+    send_alert_email(
+        f"task-complete-{task_name}-{int(time.time())}",
+        f"360doc 任务完成：{task_name}",
+        body,
+        deduplicate=False,
+    )
+
+
 def _parse_nonneg_int_ms(raw: str) -> int | None:
     s = raw.strip()
     if not s:
@@ -1084,6 +1098,12 @@ def run() -> None:
                 r_clean_only=args.r_clean_only,
                 remove_raw_when_word_only=args.remove_original and not clean_disk,
                 clean_article_pacing_sec=_LIB_PACING_SEC,
+                offline_word_only=bool(
+                    local_only_mode
+                    and args.gen_word
+                    and (not clean_disk)
+                    and (not args.r_clean_only)
+                ),
             )
             if clean_disk:
                 replay_stats = proc.replay_resource_failures_from_logs(root, session)
@@ -1107,6 +1127,11 @@ def run() -> None:
                 log_error(f"清洗阶段触发熔断，程序退出: {exc}")
                 sys.exit(3)
             raise
+        if nf == 0:
+            send_task_completion_email(
+                "wc-library",
+                "mode=local-only",
+            )
         sys.exit(0 if nf == 0 else 1)
 
     start_page = 1 if args.start_page is None else args.start_page
@@ -1155,6 +1180,10 @@ def run() -> None:
         selected_categories = resolve_selected_categories(all_categories, args)
         if not selected_categories:
             log_warn("筛选后无可处理分类；核对 --start-c / --end-c 与 --c-id / --c-name。")
+            send_task_completion_email(
+                "wc-library",
+                "mode=online\nresult=no-selected-categories",
+            )
             return
 
         _log_startup_library_config(
@@ -1268,6 +1297,11 @@ def run() -> None:
                 if _is_processer_rate_limit_error(exc):
                     raise RateLimitError(f"清洗阶段触发熔断: {exc}") from exc
                 raise
+        send_task_completion_email(
+            "wc-library",
+            "mode=online",
+        )
+        return
     except KeyboardInterrupt:
         log_warn("收到键盘中断（KeyboardInterrupt），退出。")
     except RateLimitError as exc:
