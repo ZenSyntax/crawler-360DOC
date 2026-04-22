@@ -2030,6 +2030,93 @@ def localize_resources(
     return ResourceLocalizationResult(downloaded=downloaded, failed_urls=failed_urls)
 
 
+def _is_http_like_url(value: str) -> bool:
+    v = (value or "").strip().lower()
+    return v.startswith("http://") or v.startswith("https://") or v.startswith("//")
+
+
+def strip_external_links_in_clean_html(clean_soup: BeautifulSoup) -> int:
+    """Ensure clean HTML contains no external network links."""
+    changed = 0
+
+    def _sanitize_url_attr(tag: Tag, attr: str) -> None:
+        nonlocal changed
+        if not tag.has_attr(attr):
+            return
+        raw = str(tag.get(attr, "")).strip()
+        if not raw:
+            return
+        if _is_http_like_url(raw):
+            if attr == "href":
+                tag[attr] = "#"
+            else:
+                tag.attrs.pop(attr, None)
+            changed += 1
+
+    for tag in clean_soup.find_all(True):
+        if not isinstance(tag, Tag):
+            continue
+        for attr_name in ("src", "href", "poster", "data-src", "data-original", "xlink:href"):
+            _sanitize_url_attr(tag, attr_name)
+
+        if tag.has_attr("srcset"):
+            raw_srcset = str(tag.get("srcset", "")).strip()
+            if raw_srcset:
+                kept: list[str] = []
+                for item in raw_srcset.split(","):
+                    one = item.strip()
+                    if not one:
+                        continue
+                    url_part = one.split()[0]
+                    if not _is_http_like_url(url_part):
+                        kept.append(one)
+                if kept:
+                    new_srcset = ", ".join(kept)
+                    if new_srcset != raw_srcset:
+                        tag["srcset"] = new_srcset
+                        changed += 1
+                else:
+                    tag.attrs.pop("srcset", None)
+                    changed += 1
+
+        if tag.has_attr("style"):
+            style = str(tag.get("style", ""))
+            if re.search(r"url\(\s*(['\"]?)(https?:)?//", style, flags=re.I):
+                new_style = re.sub(
+                    r"url\(\s*(['\"]?)(https?:)?//[^)]+\)",
+                    "url('')",
+                    style,
+                    flags=re.I,
+                )
+                if new_style != style:
+                    tag["style"] = new_style
+                    changed += 1
+
+    for style_tag in clean_soup.find_all("style"):
+        if not isinstance(style_tag, Tag):
+            continue
+        css_text = style_tag.string
+        if not css_text:
+            continue
+        new_css = re.sub(
+            r"url\(\s*(['\"]?)(https?:)?//[^)]+\)",
+            "url('')",
+            css_text,
+            flags=re.I,
+        )
+        new_css = re.sub(
+            r"@import\s+url\(\s*(['\"]?)(https?:)?//[^)]+\)\s*;?",
+            "",
+            new_css,
+            flags=re.I,
+        )
+        if new_css != css_text:
+            style_tag.string.replace_with(new_css)
+            changed += 1
+
+    return changed
+
+
 def _heal_imgs_missing_src_from_parent_anchor(soup: BeautifulSoup) -> None:
     # When img src is missing, fallback to parent <a href> local path and fill src.
     root = soup.select_one("#content")
@@ -4068,6 +4155,9 @@ def process_one_article(
                         f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
                         f"\tresource_failed={len(rs.failed_urls)}"
                     )
+                stripped = strip_external_links_in_clean_html(clean_soup)
+                if stripped > 0:
+                    log_info(f"清洗外链净化: {tmp_clean.name} removed={stripped}")
                 tmp_clean.write_text(str(clean_soup), encoding="utf-8")
                 if rs.downloaded > 0:
                     time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
@@ -4163,6 +4253,9 @@ def process_one_article(
                 f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
                 f"\tresource_failed={len(rs.failed_urls)}"
             )
+        stripped = strip_external_links_in_clean_html(clean_soup)
+        if stripped > 0:
+            log_info(f"清洗外链净化: {clean_path.name} removed={stripped}")
         clean_path.write_text(str(clean_soup), encoding="utf-8")
         if rs.downloaded > 0:
             time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))
@@ -4250,6 +4343,9 @@ def docx_from_raw_html_via_temp(
                     f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
                     f"\tresource_failed={len(rs.failed_urls)}"
                 )
+            stripped = strip_external_links_in_clean_html(clean_soup)
+            if stripped > 0:
+                log_info(f"清洗外链净化: {tmp_clean.name} removed={stripped}")
             tmp_clean.write_text(str(clean_soup), encoding="utf-8")
             if rs.downloaded > 0:
                 time.sleep(random.uniform(*AFTER_ARTICLE_WITH_RESOURCES_SLEEP_SEC))

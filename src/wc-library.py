@@ -732,10 +732,21 @@ def save_article_html(
         raise ValueError(f"artid 无效（需数字）: {art_id!r}")
     safe_title = trim_name(safe_title, MAX_FILE_STEM)
     file_path = category_dir / f"{art_id}-{safe_title}.html"
-    if file_path.exists() and not force_html:
-        log_info(f"cat={category_id} page={page_num} skip={file_path.name}")
-        # 目标文件已存在，返回 False。
-        return False
+    if not force_html:
+        local_raw_by_id = sorted(
+            p
+            for p in category_dir.glob(f"{art_id}-*.html")
+            if p.is_file() and not p.name.lower().startswith("clean_")
+        )
+        if local_raw_by_id:
+            log_info(f"cat={category_id} page={page_num} skip={local_raw_by_id[0].name}")
+            return False
+        local_clean_by_id = sorted(
+            p for p in category_dir.glob(f"clean_{art_id}-*.html") if p.is_file()
+        )
+        if local_clean_by_id:
+            log_info(f"cat={category_id} page={page_num} skip={local_clean_by_id[0].name}")
+            return False
 
     art_url = showweb_article_url(art_id)
     try:
@@ -1073,7 +1084,7 @@ def run() -> None:
             }
         )
         # 仅在会触发资源请求的本地流程中尝试自动登录，纯本地 word-only 不登录。
-        local_pipeline_needs_network = bool(clean_disk or args.r_clean_only)
+        local_pipeline_needs_network = bool(args.r_clean_only)
         user = os.environ.get("DOC360_USER", "").strip()
         password = os.environ.get("DOC360_PASS", "")
         if local_pipeline_needs_network and user and password:
@@ -1105,7 +1116,7 @@ def run() -> None:
                     and (not args.r_clean_only)
                 ),
             )
-            if clean_disk:
+            if clean_disk and not args.clean_only:
                 replay_stats = proc.replay_resource_failures_from_logs(root, session)
                 if replay_stats.get("entries_total", 0) > 0:
                     log_info(

@@ -369,12 +369,27 @@ def save_follow_article_html(
     safe_title = CORE.trim_name(safe_title, CORE.MAX_FILE_STEM)
     file_path = category_dir / f"{art_id}-{safe_title}.html"
 
-    if file_path.exists() and not force_html:
-        log_info(
-            f"user={user_id}-{user_name} cat={category_id}-{category_name} "
-            f"page={page_num} skip={file_path.name}"
+    if not force_html:
+        local_raw_by_id = sorted(
+            p
+            for p in category_dir.glob(f"{art_id}-*.html")
+            if p.is_file() and not p.name.lower().startswith("clean_")
         )
-        return False
+        if local_raw_by_id:
+            log_info(
+                f"user={user_id}-{user_name} cat={category_id}-{category_name} "
+                f"page={page_num} skip={local_raw_by_id[0].name}"
+            )
+            return False
+        local_clean_by_id = sorted(
+            p for p in category_dir.glob(f"clean_{art_id}-*.html") if p.is_file()
+        )
+        if local_clean_by_id:
+            log_info(
+                f"user={user_id}-{user_name} cat={category_id}-{category_name} "
+                f"page={page_num} skip={local_clean_by_id[0].name}"
+            )
+            return False
 
     art_url = CORE.showweb_article_url(art_id)
     try:
@@ -741,7 +756,7 @@ def run() -> None:
             }
         )
 
-        local_pipeline_needs_network = bool(clean_disk or args.r_clean_only)
+        local_pipeline_needs_network = bool(args.r_clean_only)
         user = os.environ.get("DOC360_USER", "").strip()
         password = os.environ.get("DOC360_PASS", "")
         if local_pipeline_needs_network and user and password:
@@ -772,7 +787,7 @@ def run() -> None:
                     and (not args.r_clean_only)
                 ),
             )
-            if clean_disk:
+            if clean_disk and not args.clean_only:
                 replay_stats = proc.replay_resource_failures_from_logs(root, session)
                 if replay_stats.get("entries_total", 0) > 0:
                     log_info(
