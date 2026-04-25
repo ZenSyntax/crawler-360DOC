@@ -4076,8 +4076,14 @@ def docx_path_for_article_html(raw_html_path: Path) -> Path:
     return raw_html_path.with_suffix(".docx")
 
 
+def _trim_windows_tail(name: str) -> str:
+    # Windows path segments cannot reliably end with spaces/dots.
+    return (name or "").rstrip(" .")
+
+
 def clean_html_path_for_raw(raw_html_path: Path) -> Path:
-    return raw_html_path.with_name(f"{CLEAN_HTML_PREFIX}{raw_html_path.name}")
+    stem = _trim_windows_tail(raw_html_path.stem) or raw_html_path.stem.strip() or "article"
+    return raw_html_path.with_name(f"{CLEAN_HTML_PREFIX}{stem}{raw_html_path.suffix}")
 
 
 def article_raw_and_clean_paths(path: Path) -> tuple[Path, Path]:
@@ -4090,7 +4096,8 @@ def article_raw_and_clean_paths(path: Path) -> tuple[Path, Path]:
 
 
 def res_dir_for_clean(clean_path: Path) -> Path:
-    return clean_path.with_suffix("")
+    stem = _trim_windows_tail(clean_path.stem) or clean_path.stem.strip() or clean_path.stem
+    return clean_path.with_name(stem)
 
 
 def _remove_clean_outputs(clean_path: Path) -> None:
