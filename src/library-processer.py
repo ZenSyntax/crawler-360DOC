@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -2001,7 +2001,7 @@ def localize_resources(
             ):
                 data = _rewrite_css_and_localize_deps(data, abs_url, local_name)
             local_path.write_bytes(data)
-            rel_ref = f"{res_dir.name}/{local_name}"
+            rel_ref = _url_safe_rel_ref_path(res_dir.name, local_name)
             url_to_local[abs_url] = rel_ref
             downloaded += 1
         elif st == "not_found":
@@ -3116,6 +3116,39 @@ def _path_under_article_base(path: Path, base_resolved: Path) -> bool:
             return False
 
 
+def _iter_local_rel_path_candidates(raw_value: str) -> list[str]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return []
+    cands: list[str] = []
+    seen: set[str] = set()
+
+    def _add(one: str) -> None:
+        s = (one or "").strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        cands.append(s)
+
+    _add(raw)
+    try:
+        _add(unquote(raw))
+    except Exception:
+        pass
+    return cands
+
+
+def _url_safe_rel_ref_path(*parts: str) -> str:
+    # Encode each path segment for href/src usage to avoid '#' being treated as fragment.
+    out: list[str] = []
+    for part in parts:
+        for seg in str(part or "").replace("\\", "/").split("/"):
+            if not seg:
+                continue
+            out.append(quote(seg, safe="-._~"))
+    return "/".join(out)
+
+
 def _resolve_local_media_path(
     src: str,
     base_dir: Path,
@@ -3126,23 +3159,25 @@ def _resolve_local_media_path(
     if not src or src.startswith(("http://", "https://", "data:")):
         return None
     base_resolved = base_dir.resolve()
-    p = (base_dir / src).resolve()
-    if p.is_file() and _path_under_article_base(p, base_resolved):
-        return p
+    for one in _iter_local_rel_path_candidates(src):
+        p = (base_dir / one).resolve()
+        if p.is_file() and _path_under_article_base(p, base_resolved):
+            return p
     if article_clean_html is None or not article_clean_html.is_file():
         return None
-    bare = Path(src.replace("\\", "/")).name
-    if not bare:
-        return None
     rd = res_dir_for_clean(article_clean_html)
-    p2 = (rd / bare).resolve()
-    if p2.is_file() and _path_under_article_base(p2, base_resolved):
-        return p2
-    alt = _res_basename_without_collision_suffix(bare)
-    if alt:
-        p3 = (rd / alt).resolve()
-        if p3.is_file() and _path_under_article_base(p3, base_resolved):
-            return p3
+    for one in _iter_local_rel_path_candidates(src):
+        bare = Path(one.replace("\\", "/")).name
+        if not bare:
+            continue
+        p2 = (rd / bare).resolve()
+        if p2.is_file() and _path_under_article_base(p2, base_resolved):
+            return p2
+        alt = _res_basename_without_collision_suffix(bare)
+        if alt:
+            p3 = (rd / alt).resolve()
+            if p3.is_file() and _path_under_article_base(p3, base_resolved):
+                return p3
     return None
 
 
@@ -3883,16 +3918,17 @@ def _read_local_css_for_docx(clean_html_path: Path, href: str) -> str:
     if not raw or raw.startswith(("http://", "https://", "data:")):
         return ""
     base = clean_html_path.parent
-    cand = (base / raw).resolve()
-    if cand.is_file():
-        return cand.read_text(encoding="utf-8", errors="ignore")
-    bare = Path(raw.replace("\\", "/")).name
-    if not bare:
-        return ""
-    rd = clean_html_path.with_suffix("")
-    cand2 = (rd / bare).resolve()
-    if cand2.is_file():
-        return cand2.read_text(encoding="utf-8", errors="ignore")
+    for one in _iter_local_rel_path_candidates(raw):
+        cand = (base / one).resolve()
+        if cand.is_file():
+            return cand.read_text(encoding="utf-8", errors="ignore")
+        bare = Path(one.replace("\\", "/")).name
+        if not bare:
+            continue
+        rd = clean_html_path.with_suffix("")
+        cand2 = (rd / bare).resolve()
+        if cand2.is_file():
+            return cand2.read_text(encoding="utf-8", errors="ignore")
     return ""
 
 

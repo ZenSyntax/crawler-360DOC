@@ -54,6 +54,8 @@ _FOLLOW_PACING_SEC: tuple[float, float] = (
 RateLimitError = CORE.RateLimitError
 ArticleNotFoundError = CORE.ArticleNotFoundError
 
+FOLLOW_VALIDATE_OVERRIDE_ENV = "DOC360_VALIDATE_OVERRIDE"
+
 
 def log_info(message: str) -> None:
     CORE.log_info(message)
@@ -69,6 +71,21 @@ def log_error(message: str) -> None:
 
 def _follow_request_pacing_sleep() -> None:
     time.sleep(random.uniform(*_FOLLOW_PACING_SEC))
+
+
+def _parse_follow_api_payload(raw_text: str, *, endpoint: str):
+    try:
+        return CORE.parse_json_lenient(raw_text)
+    except Exception as exc:
+        raise ValueError(f"{endpoint} payload parse failed: {exc}") from exc
+
+
+def _extract_follow_validate_token(data: dict) -> str:
+    for key in ("validate", "Validate", "vcode", "checkcode", "checkCode"):
+        val = str(data.get(key, "")).strip()
+        if val:
+            return val
+    return ""
 
 
 def append_follow_error_line(line: str) -> None:
@@ -104,6 +121,17 @@ def _parse_user_id_filter(raw: str | None) -> set[str]:
             raise ValueError(f"--user-id 包含非数字值: {token!r}")
         out.add(token)
     return out
+
+
+def _normalize_follow_start_cursor(raw_cursor: str | None) -> str:
+    if raw_cursor is None:
+        return "-1"
+    token = str(raw_cursor).strip()
+    if not token:
+        return "-1"
+    if not re.fullmatch(r"-?\d+", token):
+        raise ValueError(f"--cur 需要整数 articleid，收到: {raw_cursor!r}")
+    return token
 
 
 def _normalize_user_name(raw_name: str, uid: str) -> tuple[str, str]:
@@ -163,7 +191,9 @@ def fetch_followed_users_page(
         "_": int(time.time() * 1000),
     }
     resp = CORE.http_get(session, FOLLOW_USERS_API, params=params)
-    data = CORE.parse_json_lenient(resp.text)
+    data = _parse_follow_api_payload(
+        resp.text, endpoint=f"getgzusers.ashx page={curnum}"
+    )
     if not isinstance(data, dict):
         raise ValueError("关注用户列表接口返回非对象")
     return data
@@ -215,7 +245,9 @@ def fetch_all_followed_users(session: requests.Session) -> list[dict]:
 def fetch_follow_user_categories(session: requests.Session, user_id: str) -> list[dict]:
     params = {"type": 3, "userid": user_id, "_": int(time.time() * 1000)}
     resp = CORE.http_get(session, FOLLOW_USER_CATEGORY_API, params=params)
-    data = CORE.parse_json_lenient(resp.text)
+    data = _parse_follow_api_payload(
+        resp.text, endpoint=f"getmyCategory.ashx user={user_id}"
+    )
     if not isinstance(data, list):
         raise ValueError(f"关注用户分类接口返回非列表 user={user_id}")
 
@@ -314,7 +346,9 @@ def fetch_follow_category_page(
     category_id: int,
     curnum: int,
     article_cursor: str,
+    validate_token: str = "",
 ) -> dict:
+    token = os.environ.get(FOLLOW_VALIDATE_OVERRIDE_ENV, "").strip() or validate_token.strip()
     payload: dict[str, str | int] = {
         "op": "getartlistbyartid",
         "pagenum": FOLLOW_ART_PAGE_SIZE,
@@ -324,13 +358,14 @@ def fetch_follow_category_page(
         "sortarttype": 1,
         "arttype": "",
         "articleid": article_cursor,
-        "validate": "",
+        "validate": token,
         "curnum": curnum,
     }
     sign = _build_follow_sign(payload)
     params = {
         **payload,
         "sign": sign,
+        "callback": f"jQuery{random.randint(10**14, 10**15-1)}_{int(time.time() * 1000)}",
         "_": int(time.time() * 1000),
     }
     headers = {
@@ -339,9 +374,17 @@ def fetch_follow_category_page(
         "Accept": "text/html, */*; q=0.01",
     }
     resp = CORE.http_get(session, FOLLOW_ARTICLE_LIST_API, params=params, headers=headers)
-    data = CORE.parse_json_lenient(resp.text)
+    raw_text = resp.text or ""
+    data = _parse_follow_api_payload(
+        raw_text,
+        endpoint=(
+            "ArticleHandler.ashx"
+            f" user={user_id} cid={category_id} curnum={curnum}"
+        ),
+    )
     if not isinstance(data, dict):
-        raise ValueError("关注分类文章列表接口返回非对象")
+        raise ValueError("follow category article list API returned non-object")
+
     return data
 
 
@@ -424,6 +467,7 @@ def crawl_one_follow_user(
     root: Path,
     *,
     category_filter_raw: str | None,
+    start_cursor: str,
     force_html: bool,
 ) -> None:
     uid = str(user["id"])
@@ -447,9 +491,11 @@ def crawl_one_follow_user(
         category_dir = user_dir / f"{cid}-{csafe}"
         category_dir.mkdir(parents=True, exist_ok=True)
 
-        page = 1
-        article_cursor = "-1"
-        seen_tail_ids: set[str] = set()
+        curnum = 1
+        page_for_log = 1
+        cursor = start_cursor
+        seen_cursors: set[str] = set()
+        validate_token = ""
         category_error_logged = False
 
         while True:
@@ -457,20 +503,28 @@ def crawl_one_follow_user(
                 session,
                 user_id=uid,
                 category_id=cid,
-                curnum=page,
-                article_cursor=article_cursor,
+                curnum=curnum,
+                article_cursor=cursor,
+                validate_token=validate_token,
             )
             status = str(data.get("status", "")).strip()
             if status != "1":
                 log_warn(
-                    f"user={uid}-{uname} cat={cid}-{cname} page={page} "
+                    f"user={uid}-{uname} cat={cid}-{cname} "
                     f"status 异常: {status!r}"
                 )
                 break
 
+            next_validate = _extract_follow_validate_token(data)
+            if next_validate:
+                validate_token = next_validate
+
             items = data.get("listitem") or []
             if not isinstance(items, list) or not items:
-                log_info(f"user={uid}-{uname} cat={cid}-{cname} 抓取结束 page={page}")
+                log_info(
+                    f"user={uid}-{uname} cat={cid}-{cname} "
+                    f"抓取结束 curnum={curnum} cursor={cursor}"
+                )
                 break
 
             for art in items:
@@ -483,22 +537,25 @@ def crawl_one_follow_user(
                         user_name=uname,
                         category_id=cid,
                         category_name=cname,
-                        page_num=page,
+                        page_num=page_for_log,
                         force_html=force_html,
                     )
                 except Exception as exc:
                     art_id = str(art.get("articleid", "unknown"))
-                    art_title = CORE.decode_text(str(art.get("articletitle") or "").strip()) or "unknown"
+                    art_title = (
+                        CORE.decode_text(str(art.get("articletitle") or "").strip())
+                        or "unknown"
+                    )
                     art_url = str(art.get("arturl", "")).strip() or "unknown"
                     if not category_error_logged:
                         append_follow_error_line(
-                            f"user={uid}-{uname}\tcat={cid}-{cname}\tpage={page}"
+                            f"user={uid}-{uname}\tcat={cid}-{cname}\tcurnum={curnum}"
                         )
                         category_error_logged = True
                     append_follow_error_line(f"{art_id}-{art_title}-{art_url}-{exc}")
                     log_warn(
-                        f"user={uid}-{uname} cat={cid}-{cname} page={page} "
-                        f"art={art_id} err={exc}"
+                        f"user={uid}-{uname} cat={cid}-{cname} "
+                        f"curnum={curnum} art={art_id} err={exc}"
                     )
                     _follow_request_pacing_sleep()
                 else:
@@ -507,24 +564,28 @@ def crawl_one_follow_user(
 
             tail_id = str(items[-1].get("articleid", "")).strip()
             if not tail_id:
-                break
-            if tail_id == article_cursor:
-                log_warn(
-                    f"user={uid}-{uname} cat={cid}-{cname} page={page} "
-                    "cursor 未推进，停止该分类以避免死循环。"
+                log_info(
+                    f"user={uid}-{uname} cat={cid}-{cname} "
+                    "last item has empty articleid, stop category"
                 )
                 break
-            if tail_id in seen_tail_ids:
+            if tail_id == cursor:
                 log_warn(
-                    f"user={uid}-{uname} cat={cid}-{cname} page={page} "
-                    "cursor 重复，停止该分类以避免死循环。"
+                    f"user={uid}-{uname} cat={cid}-{cname} "
+                    f"curnum={curnum} cursor did not move, stop category"
                 )
                 break
-            seen_tail_ids.add(tail_id)
-            article_cursor = tail_id
-            page += 1
-            _follow_request_pacing_sleep()
+            if tail_id in seen_cursors:
+                log_warn(
+                    f"user={uid}-{uname} cat={cid}-{cname} "
+                    f"curnum={curnum} cursor repeated, stop category"
+                )
+                break
 
+            seen_cursors.add(tail_id)
+            cursor = tail_id
+            page_for_log += 1
+            _follow_request_pacing_sleep()
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -612,6 +673,17 @@ def parse_args() -> argparse.Namespace:
         metavar="CAT",
         help="按关注用户分类过滤（分类 ID 或名称片段，可逗号分隔多个）。",
     )
+    parser.add_argument(
+        "-cur",
+        "--cur",
+        dest="start_cursor",
+        default=None,
+        metavar="ARTICLE_ID",
+        help=(
+            "关注文章抓取起始游标（articleid）。"
+            "默认 -1 表示从分类起点抓取；用于程序中断后的断点续抓。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -620,6 +692,7 @@ def _log_startup_follow_config(
     root: Path,
     *,
     local_only: bool,
+    start_cursor: str,
     pacing_lo_ms: int,
     pacing_hi_ms: int,
     pacing_src: str,
@@ -650,6 +723,7 @@ def _log_startup_follow_config(
             log_info(f"用户过滤 (--user-name): {args.user_name}")
         if args.follow_category:
             log_info(f"分类过滤 (--c): {args.follow_category}")
+        log_info(f"起始游标 (-cur/--cur): {start_cursor}")
     log_info(f"数据清洗 (-c): {'是' if args.do_clean else '否'}")
     log_info(f"Word (-w/--r-c): {'是' if (args.gen_word or args.r_clean_only) else '否'}")
     log_info(f"仅本地 Word (--word-only): {'是' if args.word_only else '否'}")
@@ -702,8 +776,16 @@ def run() -> None:
     if args.r_clean_only:
         args.gen_word = True
 
+    try:
+        start_cursor = _normalize_follow_start_cursor(args.start_cursor)
+    except ValueError as exc:
+        log_error(str(exc))
+        sys.exit(1)
+
     local_only_mode = bool(args.local_only or args.word_only or args.clean_only)
     clean_disk = bool(args.do_clean and not args.r_clean_only)
+    if local_only_mode and args.start_cursor is not None:
+        log_warn("参数 -cur/--cur 在本地模式下无效，已忽略。")
 
     root = (
         Path(args.work_dir).expanduser()
@@ -715,7 +797,6 @@ def run() -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     FOLLOW_ERROR_URL_FILE = logs_dir / "follow_error_url.txt"
     FOLLOW_NOT_FOUND_WARNING_FILE = logs_dir / "follow_not_found_warning.txt"
-
     pacing_lo_ms, pacing_hi_ms, pacing_src = CORE.resolve_request_pacing_ms()
     _FOLLOW_PACING_SEC = (pacing_lo_ms / 1000.0, pacing_hi_ms / 1000.0)
 
@@ -738,6 +819,7 @@ def run() -> None:
             args,
             root,
             local_only=True,
+            start_cursor=start_cursor,
             pacing_lo_ms=pacing_lo_ms,
             pacing_hi_ms=pacing_hi_ms,
             pacing_src=pacing_src,
@@ -859,6 +941,7 @@ def run() -> None:
             args,
             root,
             local_only=False,
+            start_cursor=start_cursor,
             pacing_lo_ms=pacing_lo_ms,
             pacing_hi_ms=pacing_hi_ms,
             pacing_src=pacing_src,
@@ -877,6 +960,7 @@ def run() -> None:
                     u,
                     root,
                     category_filter_raw=args.follow_category,
+                    start_cursor=start_cursor,
                     force_html=args.force,
                 )
             except Exception as exc:

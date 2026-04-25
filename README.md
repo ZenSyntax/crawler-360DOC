@@ -224,6 +224,11 @@ python wc-follow.py --user-name 张三,李四
 python wc-follow.py --c 2,养生
 ```
 
+从指定文章游标断点续抓（建议配合 `--user-name` + `--c` 精确到单个分类）：
+```bash
+python wc-follow.py --user-name 昵称m5Gu5 --c 技战术技能 -cur 1110169738
+```
+
 ### 8.2 参数一览
 - `-d/--d DIR`：输出根目录（默认 `output-space/my-follow`）
 - `-f/--f`：强制覆盖
@@ -235,6 +240,7 @@ python wc-follow.py --c 2,养生
 - `--user-id ID`：仅抓指定关注用户 ID（可逗号分隔多个）
 - `--user-name NAME`：仅抓指定关注用户名（精确或包含匹配，可逗号分隔多个）
 - `--c CAT`：按关注用户分类过滤（分类 ID 或名称片段，可逗号分隔多个）
+- `-cur/--cur ARTICLE_ID`：设置关注文章抓取起始游标（默认 `-1`，用于中断后断点续抓）
 - `--r`：清洗完成后删除原始 HTML（仅 Word 时删除 raw 保留 clean）
 - `--r-c`：仅保留 docx（删除 raw/clean HTML 与资源目录，需同时使用 `-w`）
 
@@ -243,6 +249,10 @@ python wc-follow.py --c 2,养生
 - 本地 `--clean-only` 与 `--r-c` 可能触发资源请求，存在账号密码时会尝试自动登录。
 - 关注抓取目录层级为：`<输出根>/<用户ID-用户名>/<分类ID-分类名>/<artid-title>.html`。
 - 清洗/Word 处理复用 `library-processer.py`，行为与 `wc-library` 保持一致。
+- 关注文章列表分页策略：固定 `curnum=1`，首请求 `articleid=-1`，后续使用返回 `listitem` 最后一条 `articleid` 作为游标继续请求，直到返回空列表结束该分类。
+- 可通过 `-cur/--cur` 指定首个请求的 `articleid`，实现断点续抓；`page` 日志仍从 1 开始，仅用于审计。
+- 关注抓取链路不再包含验证码人工处理（打开浏览器/Playwright）和验证码重试包装；接口返回异常时按当前响应直接停止该分类。
+- 不再输出 `logs/follow_captcha_trace.jsonl` 与 `logs/follow_chain_state.json`。
 
 ## 9. 回放脚本（replay_clean_logs.py）
 脚本路径：
@@ -271,6 +281,7 @@ python src/replay_clean_logs.py --root output-space/my-category
 - `resources_not_found_warning.txt`：资源 404 告警（不计失败）
 - `essay_error_url.txt`：随笔抓取异常
 - `follow_error_url.txt`：关注抓取异常
+- `follow_captcha_trace.jsonl` / `follow_chain_state.json`：已停用，不再生成。
 
 ## 11. 清洗与资源处理策略
 - 404与424排除：
@@ -317,6 +328,8 @@ python src/replay_clean_logs.py --root output-space/my-category
 - 正文提取：标准正文 + Word 预览 + PPT 预览兜底
 - 清洗模板：输出 `clean_*.html`
 - 资源本地化：收集 `img/a/source`，下载后回写为相对路径
+- 本地资源引用写回时按路径段做 URL 编码（如 `#`、`&`），避免浏览器将 `#` 误判为锚点导致图片加载失败
+- DOCX 转换阶段解析本地资源路径时支持原始值与 URL 解码值双通道匹配，兼容历史与新格式 clean 文件
 
 资源候选构造来源：
 - 标签自身属性：`src` / `data-src` / `data-original` / `data360-src`
