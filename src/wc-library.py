@@ -150,6 +150,10 @@ class RateLimitError(RuntimeError):
     pass
 
 
+class AuthError(RuntimeError):
+    pass
+
+
 class ArticleNotFoundError(RuntimeError):
     pass
 
@@ -593,6 +597,66 @@ def prime_browser_context(session: requests.Session) -> None:
         log_warn(f"访问站点首页失败（忽略）: {exc}")
 
 
+_LOGIN_FAILURE_CODE_HINTS: dict[str, str] = {
+    "0": "unknown login failure",
+    "2": "account does not exist or disabled",
+    "3": "password incorrect",
+    "4": "captcha required or verification failed",
+    "5": "account/password mismatch or extra login step not completed",
+}
+
+
+def _parse_login_ashx_result(body: str) -> tuple[str, str]:
+    text = (body or "").strip()
+    if not text:
+        return "unknown", "login.ashx returned empty body"
+
+    failure_keywords = (
+        "密码和账户名不匹配",
+        "账户名不匹配",
+        "账户名和密码不匹配",
+        "账号或密码",
+        "未登录",
+        "验证码",
+        "失败",
+        "error",
+    )
+    if any(k in text for k in failure_keywords):
+        return "failure", text
+
+    if re.fullmatch(r"\d+", text):
+        if text == "1":
+            return "success", "ok"
+        hint = _LOGIN_FAILURE_CODE_HINTS.get(text, "unknown login code")
+        return "failure", f"login.ashx code={text} ({hint})"
+
+    lowered = text.lower()
+    if lowered in {"ok", "true", "success"}:
+        return "success", "ok"
+    if "success" in lowered or "成功" in text:
+        return "success", text
+    # 某些账号会返回跳转标记（如 tofavor），需以后续接口探针判定登录态。
+    return "unknown", f"unrecognized login response: {text[:120]!r}"
+
+
+def _validate_login_session(session: requests.Session) -> None:
+    params = {"type": 3, "_": int(time.time() * 1000)}
+    resp = http_get(session, GET_MY_CATEGORY, params=params)
+    raw = (resp.text or "").strip()
+    if not raw:
+        raise AuthError("post-login category probe returned empty response")
+    try:
+        data = parse_json_lenient(raw)
+    except Exception as exc:
+        raise AuthError(
+            f"post-login category probe is not valid JSON: {raw[:120]!r}"
+        ) from exc
+    if not isinstance(data, list):
+        raise AuthError(
+            f"post-login category probe returned non-list payload: {raw[:120]!r}"
+        )
+
+
 def login(session: requests.Session, user: str, password: str) -> None:
     http_get(session, LOGIN_PAGE)
     params = {
@@ -608,7 +672,15 @@ def login(session: requests.Session, user: str, password: str) -> None:
     preview = body[:300] + ("..." if len(body) > 300 else "")
     log_info(f"login.ashx status={resp.status_code}, body={preview!r}")
     if resp.status_code != 200:
-        raise RuntimeError(f"登录请求状态异常: {resp.status_code}")
+        raise RuntimeError(f"login request status error: {resp.status_code}")
+    result, reason = _parse_login_ashx_result(body)
+    if result == "failure":
+        raise AuthError(f"login.ashx rejected credentials/session: {reason}")
+    if result == "unknown":
+        log_warn(
+            "login.ashx returned unrecognized payload; continue with session probe: "
+            f"{reason}"
+        )
 
     try:
         alert_resp = http_get(
@@ -618,8 +690,8 @@ def login(session: requests.Session, user: str, password: str) -> None:
         )
         log_info(f"LoginAlertHandler status={alert_resp.status_code}")
     except Exception as exc:
-        log_warn(f"LoginAlertHandler 调用失败（忽略）: {exc}")
-
+        log_warn(f"LoginAlertHandler request failed (ignored): {exc}")
+    _validate_login_session(session)
 
 def _category_list_kind(cid: int) -> str:
     if cid == -3000:
@@ -632,7 +704,10 @@ def _category_list_kind(cid: int) -> str:
 def fetch_categories(session: requests.Session) -> list[dict]:
     params = {"type": 3, "_": int(time.time() * 1000)}
     resp = http_get(session, GET_MY_CATEGORY, params=params)
-    data = parse_json_lenient(resp.text)
+    raw = (resp.text or "").strip()
+    if not raw:
+        raise AuthError("category API returned empty response, likely not logged in")
+    data = parse_json_lenient(raw)
     if not isinstance(data, list):
         raise ValueError("分类接口返回非列表")
     categories: list[dict] = []
@@ -1084,7 +1159,7 @@ def run() -> None:
             }
         )
         # 仅在会触发资源请求的本地流程中尝试自动登录，纯本地 word-only 不登录。
-        local_pipeline_needs_network = bool(args.r_clean_only)
+        local_pipeline_needs_network = bool(clean_disk or args.r_clean_only)
         user = os.environ.get("DOC360_USER", "").strip()
         password = os.environ.get("DOC360_PASS", "")
         if local_pipeline_needs_network and user and password:
@@ -1097,6 +1172,11 @@ def run() -> None:
                 )
             except Exception as exc:
                 log_warn(f"local mode auto-login failed (continue without login): {exc}")
+        elif local_pipeline_needs_network:
+            log_warn(
+                "local clean pipeline may request network resources, but DOC360_USER/"
+                "DOC360_PASS is missing; continue without authenticated session."
+            )
         try:
             nf = proc.run_clean_and_word_pass(
                 root,
@@ -1164,6 +1244,7 @@ def run() -> None:
         log_error("缺少环境变量 DOC360_USER 或 DOC360_PASS。")
         sys.exit(1)
 
+    configure_email_from_environment()
     session = requests.Session()
     session.headers.update(HEADERS)
     try:
@@ -1177,7 +1258,6 @@ def run() -> None:
         log_error(f"登录失败: {exc}")
         sys.exit(2)
     prime_browser_context(session)
-    configure_email_from_environment()
 
     try:
         all_categories = fetch_categories(session)
@@ -1328,6 +1408,14 @@ def run() -> None:
         )
         log_error(f"疑似限流，程序退出: {exc}")
         sys.exit(3)
+    except AuthError as exc:
+        send_alert_email(
+            "auth-lost",
+            "360doc 抓取告警：登录态失效或未建立",
+            f"认证失败: {exc}\n\n{traceback.format_exc()}",
+        )
+        log_error(f"登录态失效或未建立: {exc}")
+        sys.exit(2)
     except Exception as exc:
         send_alert_email(
             "unexpected-stop",
@@ -1340,3 +1428,4 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+

@@ -1,4 +1,4 @@
-"""360doc 关注用户抓取入口：抓取我关注用户的分类文章，并可选清洗/转 Word。"""
+"""360doc 关注用户抓取入口：抓取关注用户分类文章，并可选清洗/转 Word。"""
 
 from __future__ import annotations
 
@@ -15,9 +15,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 

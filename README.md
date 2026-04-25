@@ -6,10 +6,11 @@
 通过本工具下载、转换或保存的任何内容，其著作权与使用条件以原站点及权利方为准。使用者须自行遵守法律法规、平台用户协议与著作权相关规定；**不得以本工具实施爬取他人未授权作品、传播盗版、商用侵权等行为**。若以学习、技术验证为目的使用本仓库，请在完成学习或验证后 **24 小时内** 删除不再需要的本地副本（或仅保留法律允许范围内的个人备份），并勿对外再分发所抓取的完整内容。因使用本软件而产生的行政、民事或刑事责任，**由使用方自行承担**，详见仓库根目录 [`LICENSE`](https://github.com/ZenSyntax/crawler-360DOC/blob/master/LICENSE) 文件。
 
 ## 1. 项目概述
-本项目用于在**已登录 360doc 账号**前提下，备份个人文库与随笔数据，并提供清洗、资源本地化、Word 导出、失败回放复洗与告警能力。
+本项目用于在**已登录 360doc 账号**前提下，备份个人文库、随笔与关注用户文章数据，并提供清洗、资源本地化、Word 导出、失败回放复洗与告警能力。
 
 主要能力：
 - 文库抓取：按分类/分页抓取文章 HTML。
+- 关注抓取：按“关注用户 -> 分类”抓取文章 HTML。
 - 数据清洗：输出 `clean_*.html`，并重组正文结构。
 - 资源本地化：将图片/附件下载到本地目录并回写相对路径。
 - Word 导出：将清洗后的 HTML 转换为 `.docx`。
@@ -24,12 +25,14 @@
 │  ├─ _site_paths.py
 │  ├─ wc-library.py         # 文章抓取模块
 │  ├─ wc-essay.py           # 随笔抓取模块
+│  ├─ wc-follow.py          # 关注用户抓取模块
 │  ├─ library-processer.py  # 文章清洗模块
 │  ├─ essay-to-word.py      # 随笔转 Word 文档模块
 │  └─ replay_clean_logs.py  # 清洗失败复洗模块（依赖相关日志文档）
 ├─ logs/                    # 异常日志输出目录
 ├─ wc-library.py            # 根目录入口，转发到 src/wc-library.py
 ├─ wc-essay.py              # 根目录入口，转发到 src/wc-essay.py
+├─ wc-follow.py             # 根目录入口，转发到 src/wc-follow.py
 └─ .env-keep                # 环境变量，配置系统运行信息
 ```
 
@@ -74,9 +77,11 @@ pip install requests beautifulsoup4 python-docx python-dotenv pillow
 - 根目录入口（推荐）：
   - `python wc-library.py`
   - `python wc-essay.py`
+  - `python wc-follow.py`
 - 直接运行 `src`：
   - `python src/wc-library.py`
   - `python src/wc-essay.py`
+  - `python src/wc-follow.py`
 
 ## 6. 文库脚本（wc-library.py）
 
@@ -180,7 +185,66 @@ python wc-essay.py --word-only
 - `wc-essay --word-only` 需要目标目录已存在，否则直接退出。
 - 未加 `-f` 时按 mtime 增量更新 docx；加 `-f` 时强制全量覆盖。
 
-## 8. 回放脚本（replay_clean_logs.py）
+## 8. 关注脚本（wc-follow.py）
+
+### 8.1 常用命令
+抓取全部关注用户文章（按用户与分类遍历）：
+```bash
+python wc-follow.py
+```
+
+抓取 + 清洗：
+```bash
+python wc-follow.py -c
+```
+
+抓取 + 清洗 + Word：
+```bash
+python wc-follow.py -c -w
+```
+
+仅清洗本地已有（不抓取）：
+```bash
+python wc-follow.py --clean-only
+```
+
+仅将本地清洗文件转换为 Word（不抓取）：
+```bash
+python wc-follow.py --word-only
+```
+
+按关注用户过滤（ID / 昵称）：
+```bash
+python wc-follow.py --user-id 12345678,87654321
+python wc-follow.py --user-name 张三,李四
+```
+
+按关注用户分类过滤（ID 或名称片段）：
+```bash
+python wc-follow.py --c 2,养生
+```
+
+### 8.2 参数一览
+- `-d/--d DIR`：输出根目录（默认 `output-space/my-follow`）
+- `-f/--f`：强制覆盖
+- `-c`：启用清洗
+- `-w/--w`：导出 Word
+- `--word-only`：仅对本地已有的 `clean_*.html` 转 Word
+- `--clean-only`：仅对本地已有 HTML 执行清洗
+- `--local-only`：仅处理本地已有数据，配合 `-c/-w/--r-c` 使用
+- `--user-id ID`：仅抓指定关注用户 ID（可逗号分隔多个）
+- `--user-name NAME`：仅抓指定关注用户名（精确或包含匹配，可逗号分隔多个）
+- `--c CAT`：按关注用户分类过滤（分类 ID 或名称片段，可逗号分隔多个）
+- `--r`：清洗完成后删除原始 HTML（仅 Word 时删除 raw 保留 clean）
+- `--r-c`：仅保留 docx（删除 raw/clean HTML 与资源目录，需同时使用 `-w`）
+
+### 8.3 关键行为说明（代码对齐）
+- 关注抓取阶段复用 `wc-library` 的登录、会话与告警能力。
+- 本地 `--clean-only` 与 `--r-c` 可能触发资源请求，存在账号密码时会尝试自动登录。
+- 关注抓取目录层级为：`<输出根>/<用户ID-用户名>/<分类ID-分类名>/<artid-title>.html`。
+- 清洗/Word 处理复用 `library-processer.py`，行为与 `wc-library` 保持一致。
+
+## 9. 回放脚本（replay_clean_logs.py）
 脚本路径：
 ```bash
 python src/replay_clean_logs.py --root output-space/my-category
@@ -198,7 +262,7 @@ python src/replay_clean_logs.py --root output-space/my-category
 
 补充：该脚本主要用于测试，且在主程序模块内自动引用，**一般不需要单独使用**。
 
-## 9. 日志文件
+## 10. 日志文件
 日志统一输出到 `logs/`：
 - `library_error_url.txt`：文库文章抓取失败
 - `library_not_found_warning.txt`：文库文章 404 告警（不计失败）
@@ -206,8 +270,9 @@ python src/replay_clean_logs.py --root output-space/my-category
 - `clean_article_error.txt`：单篇文章清洗失败汇总
 - `resources_not_found_warning.txt`：资源 404 告警（不计失败）
 - `essay_error_url.txt`：随笔抓取异常
+- `follow_error_url.txt`：关注抓取异常
 
-## 10. 清洗与资源处理策略
+## 11. 清洗与资源处理策略
 - 404与424排除：
   - 文章/资源 404 / 424 记为 warning，不计为清洗失败。
 - 清洗失败回滚：
@@ -221,7 +286,7 @@ python src/replay_clean_logs.py --root output-space/my-category
 
 # 逆向分析
 
-## 11. 登录与会话建立
+## 12. 登录与会话建立
 关键接口：
 - `GET /login.aspx`
 - `GET /ajax/login/login.ashx?email=...&pws=md5(pass)&isr=1&login=1&code=&_=timestamp`
@@ -233,7 +298,7 @@ python src/replay_clean_logs.py --root output-space/my-category
 - 登录后追加 `LoginAlertHandler` 和首页访问，提升后续接口稳定性。
 - 文库文章页请求头刻意贴近浏览器文档请求（含 `Sec-Fetch-*`、`Referer`、清空 `X-Requested-With`）。
 
-## 12. 文库抓取 API 结构
+## 13. 文库抓取 API 结构
 分类接口：
 - `GET /ajax/getmyCategory.ashx?type=3&_={ms}`
 - 关键字段：`id`、`artnum`、`CategoryName/selftitle`
@@ -247,7 +312,7 @@ python src/replay_clean_logs.py --root output-space/my-category
 - `GET /showweb/0/0/{artid}.aspx`
 - 代码统一使用 `showweb` 模板，不依赖列表 `arturl`。
 
-## 13. 清洗与资源抓取链路
+## 14. 清洗与资源抓取链路
 清洗核心模块：`src/library-processer.py`
 - 正文提取：标准正文 + Word 预览 + PPT 预览兜底
 - 清洗模板：输出 `clean_*.html`
@@ -259,12 +324,12 @@ python src/replay_clean_logs.py --root output-space/my-category
 - `changeurl` 返回映射缓存
 - 同路径多主机族（`checku/checki/imgu/imgi`）补偿尝试
 
-## 14. 图片 URL 转换签名算法（核心）
+## 15. 图片 URL 转换签名算法（核心）
 对应代码函数：
 - `_img_change_sign`
 - `_request_changeurl_signed_images`
 
-### 14.1 请求接口
+### 15.1 请求接口
 - `POST /Ajax/imgurl.ashx?op=changeurl&_={ms}`
 
 表单参数：
@@ -276,7 +341,7 @@ python src/replay_clean_logs.py --root output-space/my-category
 - `X-Requested-With: XMLHttpRequest`
 - `User-Agent: Session UA`
 
-### 14.2 sign 生成算法（与代码完全一致）
+### 15.2 sign 生成算法（与代码完全一致）
 输入参数集合：`{"op": "changeurl", "imgurl": "<csv>"}`  
 步骤：
 1. 参数转 `k=v`（空值不参与）  
@@ -300,7 +365,7 @@ sign = sha1(joined.encode("utf-8")).hexdigest().upper()
 - 当前实现不是 HMAC，而是直接 SHA1 摘要。
 - 在当前参数键集合下，排序后通常是 `imgurl=...op=changeurl` 再做 SHA1。
 
-### 14.3 响应解析
+### 15.3 响应解析
 典型返回：
 - `status == "1"`
 - `imgurl`（URL 编码后的逗号串）
@@ -313,13 +378,13 @@ sign = sha1(joined.encode("utf-8")).hexdigest().upper()
 5. 过滤域名与有效性  
 6. 若 `Expires <= now + 15s`，直接丢弃，避免“拿到即过期”
 
-## 15. domain / Expires / Signature 的处理
+## 16. domain / Expires / Signature 的处理
 - `domain` 的提示值来自分类接口 `artnum`，通过目录名前缀分类 ID 映射到文章处理上下文。
 - 签名过期或即将过期时，会触发惰性刷新：
   - 再调 `changeurl` 获取新签名 URL
   - 必要时基于当前时间重组参数并补 `domain` 提示再试
 
-## 16. 异常分类、熔断与告警
+## 17. 异常分类、熔断与告警
 `request_with_retry` 的语义（清洗资源请求）：
 - `404` 或正文含 404 特征：`ResourceNotFoundError`（warning，不计失败）
 - 403 且命中过期特征：`ResourceExpiredError`（刷新签名重试）
@@ -331,13 +396,15 @@ sign = sha1(joined.encode("utf-8")).hexdigest().upper()
   - 先发送告警邮件
   - 再以状态码 5 退出
 
-## 17. 并发与频控
+## 18. 并发与频控
 - 资源并发：`workers = min(unique_urls, DOC360_MAX_WORKERS)`
 - 任务启动抖动：每个资源任务在发起前随机短暂停顿
 - 抓取频控：文章间/页间按 `DOC360_MIN_TIME ~ DOC360_MAX_TIME` 随机等待
 - 清洗频控：文章与文章之间同区间随机等待
 
-## 18. 与代码一致的实现结论
+## 19. 与代码一致的实现结论
 - 项目已经形成“抓取 -> 清洗 -> 本地化 -> 导出 -> 回放修复”闭环。
 - `changeurl` 签名转换 + 过期刷新是私有资源可用性的关键。
 - 404 与失败分流、403 黑名单告警、回放复洗机制共同提升可恢复性与可维护性。
+
+- 覆盖文库、随笔、关注用户三类抓取入口，处理链路保持一致。
