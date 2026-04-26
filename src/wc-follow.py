@@ -399,7 +399,8 @@ def save_follow_article_html(
     category_name: str,
     page_num: int,
     force_html: bool,
-) -> bool:
+) -> tuple[bool, Path | None]:
+    """保存关注文章 raw HTML，并返回 `(did_save, raw_html_path)`。"""
     art_id = str(article.get("articleid", "")).strip()
     if not re.fullmatch(r"\d+", art_id):
         raise ValueError(f"articleid 无效（需数字）: {art_id!r}")
@@ -409,19 +410,22 @@ def save_follow_article_html(
     safe_title = CORE.sanitize_name(title, art_id or "untitled")
     safe_title = CORE.trim_name(safe_title, CORE.MAX_FILE_STEM)
     file_path = category_dir / f"{art_id}-{safe_title}.html"
+    local_raw_by_id = sorted(
+        p
+        for p in category_dir.glob(f"{art_id}-*.html")
+        if p.is_file() and not p.name.lower().startswith("clean_")
+    )
+    if force_html:
+        for old in local_raw_by_id:
+            old.unlink(missing_ok=True)
 
     if not force_html:
-        local_raw_by_id = sorted(
-            p
-            for p in category_dir.glob(f"{art_id}-*.html")
-            if p.is_file() and not p.name.lower().startswith("clean_")
-        )
         if local_raw_by_id:
             log_info(
                 f"user={user_id}-{user_name} cat={category_id}-{category_name} "
                 f"page={page_num} skip={local_raw_by_id[0].name}"
             )
-            return False
+            return False, local_raw_by_id[0]
         local_clean_by_id = sorted(
             p for p in category_dir.glob(f"clean_{art_id}-*.html") if p.is_file()
         )
@@ -430,7 +434,7 @@ def save_follow_article_html(
                 f"user={user_id}-{user_name} cat={category_id}-{category_name} "
                 f"page={page_num} skip={local_clean_by_id[0].name}"
             )
-            return False
+            return False, None
 
     art_url = CORE.showweb_article_url(art_id)
     try:
@@ -444,7 +448,7 @@ def save_follow_article_html(
             f"user={user_id}-{user_name} cat={category_id}-{category_name} "
             f"page={page_num} not_found={art_id}-{safe_title}.html"
         )
-        return False
+        return False, None
 
     html_bytes = html_resp.content
     encoding = html_resp.encoding or "utf-8"
@@ -458,17 +462,19 @@ def save_follow_article_html(
         f"user={user_id}-{user_name} cat={category_id}-{category_name} "
         f"page={page_num} saved={file_path.name}"
     )
-    return True
+    return True, file_path
 
 
 def crawl_one_follow_user(
     session: requests.Session,
     user: dict,
     root: Path,
+    proc,
     *,
     category_filter_raw: str | None,
     start_cursor: str,
     force_html: bool,
+    auto_mode: bool,
 ) -> None:
     uid = str(user["id"])
     uname = str(user["name"])
@@ -529,7 +535,7 @@ def crawl_one_follow_user(
 
             for art in items:
                 try:
-                    did_fetch = save_follow_article_html(
+                    _, raw_html_path = save_follow_article_html(
                         session,
                         art,
                         category_dir,
@@ -559,8 +565,16 @@ def crawl_one_follow_user(
                     )
                     _follow_request_pacing_sleep()
                 else:
-                    if did_fetch:
-                        _follow_request_pacing_sleep()
+                    if auto_mode and raw_html_path is not None:
+                        st = proc.process_one_article_auto(
+                            raw_html_path,
+                            session,
+                            force_clean=force_html,
+                            force_docx=force_html,
+                        )
+                        if st == "failed":
+                            log_warn(f"auto 流水线处理失败: {raw_html_path.name}")
+                    _follow_request_pacing_sleep()
 
             tail_id = str(items[-1].get("articleid", "")).strip()
             if not tail_id:
@@ -653,6 +667,15 @@ def parse_args() -> argparse.Namespace:
         help="仅保留 .docx：删除 raw、clean_ HTML 与本地媒体目录（需同时使用 -w）。",
     )
     parser.add_argument(
+        "--auto",
+        dest="auto_mode",
+        action="store_true",
+        help=(
+            "自动流水线模式：每篇原始 HTML 落盘后立即清洗并生成 Word；"
+            "纯文档预览文章直接下载原文档。启用后忽略 -w/-c/--word-only/--clean-only/--r/--r-c。"
+        ),
+    )
+    parser.add_argument(
         "--user-id",
         dest="user_id",
         default=None,
@@ -708,6 +731,8 @@ def _log_startup_follow_config(
             log_info("模式: 仅本地处理（--local-only），不登录、不抓取")
     else:
         log_info("模式: 登录并抓取关注用户文章 HTML")
+        if args.auto_mode:
+            log_info("自动流水线 (--auto): 是（每篇抓取后立即清洗+Word，纯文档直下载）")
     if args.work_dir:
         log_info(f"输出根目录: {root.resolve()}（由 -d / --d 指定）")
     else:
@@ -768,6 +793,15 @@ def run() -> None:
     global _FOLLOW_PACING_SEC
 
     args = parse_args()
+    if args.auto_mode:
+        if args.word_only or args.clean_only or args.do_clean or args.gen_word or args.remove_original or args.r_clean_only:
+            log_warn("启用 --auto：已忽略 -w/-c/--word-only/--clean-only/--r/--r-c。")
+        args.word_only = False
+        args.clean_only = False
+        args.do_clean = False
+        args.gen_word = False
+        args.remove_original = False
+        args.r_clean_only = False
     if args.word_only:
         args.gen_word = True
         args.do_clean = False
@@ -782,6 +816,9 @@ def run() -> None:
         log_error(str(exc))
         sys.exit(1)
 
+    if args.auto_mode and args.local_only:
+        log_warn("启用 --auto：已忽略 --local-only（自动流水线需要在线抓取）。")
+        args.local_only = False
     local_only_mode = bool(args.local_only or args.word_only or args.clean_only)
     clean_disk = bool(args.do_clean and not args.r_clean_only)
     if local_only_mode and args.start_cursor is not None:
@@ -959,9 +996,11 @@ def run() -> None:
                     session,
                     u,
                     root,
+                    proc,
                     category_filter_raw=args.follow_category,
                     start_cursor=start_cursor,
                     force_html=args.force,
+                    auto_mode=bool(args.auto_mode),
                 )
             except Exception as exc:
                 append_follow_error_line(f"user={uid}-{uname}\terr={exc}")
@@ -969,7 +1008,7 @@ def run() -> None:
                 _follow_request_pacing_sleep()
 
         gen_word_effective = bool(args.gen_word or args.r_clean_only)
-        if clean_disk or gen_word_effective:
+        if (not args.auto_mode) and (clean_disk or gen_word_effective):
             try:
                 proc.run_clean_and_word_pass(
                     root,

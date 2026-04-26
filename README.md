@@ -122,6 +122,11 @@ python wc-library.py --start-c 5 --end-c 10 --c-id --start-page 1 --end-page 3
 python wc-library.py --r-c
 ```
 
+在线自动流水线（抓取后立即清洗并转 Word）：
+```bash
+python wc-library.py --auto
+```
+
 ### 6.2 启动参数一览
 - `-d/--d DIR`：输出根目录
 - `-f/--f`：强制覆盖
@@ -130,6 +135,7 @@ python wc-library.py --r-c
 - `--word-only`：仅对本地已有的 `clean_*.html` 转 Word
 - `--clean-only`：仅对本地已有的`<atr_id>-exampleArticle.html` 进行清洗
 - `--local-only`：仅处理本地已有数据，配合 `-c/-w` 使用
+- `--auto`：在线自动流水线；每篇 raw HTML 落盘后立即清洗并生成 Word，纯文档预览文章直接下载原文档
 - `--start-page N` / `--end-page N`：列表页码范围
 - `--start-c V` / `--end-c V`：分类范围
 - `--c-id`：按分类 ID 解析范围
@@ -141,6 +147,10 @@ python wc-library.py --r-c
 - `--r-c` 会在代码中自动启用 Word 管线，不要求必须显式加 `-w`。
 - `--local-only` 仅在需要网络资源的流程（如清洗或 `--r-c`）且存在账号密码时才自动登录；纯 `--word-only` 不登录。
 - 本地 `--word-only` 在未加 `-f` 且目标 `.docx` 已存在时直接跳过；无额外等待节奏。
+- `--auto` 启用后会忽略 `-w/-c/--word-only/--clean-only/--r/--r-c`；若同时传入 `--local-only` 也会被忽略。
+- `--auto` 按“抓取 -> 清洗 -> Word/原文档下载”逐篇执行；任一环节失败即停止该篇后续环节，不进入覆盖流程。
+- `--auto` 未加 `-f` 时，若某环节本地产物已存在则该环节跳过；加 `-f` 时先删除该环节产物再重新生成。
+- `--auto` 对同一篇文章的环节切换不做额外等待；环节内部的重试/频控策略保持不变。
 - 当启用清洗（`clean_disk=True`）时，清洗结束后会自动执行一次日志回放复洗（`replay_resource_failures_from_logs`）。
 - 文章页抓取遇到 403 且判定黑名单拦截会立即告警并退出。
 - 清洗阶段遇到 403 熔断；若异常文本包含 `blacklist`，会发邮件后退出（状态码 5）。
@@ -229,6 +239,11 @@ python wc-follow.py --c 2,养生
 python wc-follow.py --user-name 昵称m5Gu5 --c 技战术技能 -cur 1110169738
 ```
 
+在线自动流水线（抓取后立即清洗并转 Word）：
+```bash
+python wc-follow.py --user-name 昵称m5Gu5 --c 技战术技能 --auto
+```
+
 ### 8.2 参数一览
 - `-d/--d DIR`：输出根目录（默认 `output-space/my-follow`）
 - `-f/--f`：强制覆盖
@@ -237,6 +252,7 @@ python wc-follow.py --user-name 昵称m5Gu5 --c 技战术技能 -cur 1110169738
 - `--word-only`：仅对本地已有的 `clean_*.html` 转 Word
 - `--clean-only`：仅对本地已有 HTML 执行清洗
 - `--local-only`：仅处理本地已有数据，配合 `-c/-w/--r-c` 使用
+- `--auto`：在线自动流水线；每篇 raw HTML 落盘后立即清洗并生成 Word，纯文档预览文章直接下载原文档
 - `--user-id ID`：仅抓指定关注用户 ID（可逗号分隔多个）
 - `--user-name NAME`：仅抓指定关注用户名（精确或包含匹配，可逗号分隔多个）
 - `--c CAT`：按关注用户分类过滤（分类 ID 或名称片段，可逗号分隔多个）
@@ -253,6 +269,10 @@ python wc-follow.py --user-name 昵称m5Gu5 --c 技战术技能 -cur 1110169738
 - 可通过 `-cur/--cur` 指定首个请求的 `articleid`，实现断点续抓；`page` 日志仍从 1 开始，仅用于审计。
 - 关注抓取链路不再包含验证码人工处理（打开浏览器/Playwright）和验证码重试包装；接口返回异常时按当前响应直接停止该分类。
 - 不再输出 `logs/follow_captcha_trace.jsonl` 与 `logs/follow_chain_state.json`。
+- `--auto` 启用后会忽略 `-w/-c/--word-only/--clean-only/--r/--r-c`；若同时传入 `--local-only` 也会被忽略。
+- `--auto` 按“抓取 -> 清洗 -> Word/原文档下载”逐篇执行；任一环节失败即停止该篇后续环节，不进入覆盖流程。
+- `--auto` 未加 `-f` 时，若某环节本地产物已存在则该环节跳过；加 `-f` 时先删除该环节产物再重新生成。
+- `--auto` 对同一篇文章的环节切换不做额外等待；环节内部的重试/频控策略保持不变。
 
 ## 9. 回放脚本（replay_clean_logs.py）
 脚本路径：

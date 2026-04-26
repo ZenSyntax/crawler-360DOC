@@ -4357,6 +4357,127 @@ def process_one_article(
         return "failed", False
 
 
+def process_one_article_auto(
+    path: Path,
+    session: requests.Session,
+    *,
+    force_clean: bool,
+    force_docx: bool,
+) -> str:
+    """Auto pipeline for online crawling.
+
+    Behavior:
+    - Preview-only articles (word/ppt/pdf): download original document directly
+      and save with clean-stem-aligned basename.
+    - Normal articles: clean to clean_*.html (+resources), then generate docx.
+    """
+    raw_path, clean_path = article_raw_and_clean_paths(path)
+    src_html = raw_path if raw_path.is_file() else clean_path
+    if not src_html.is_file():
+        log_warn(f"auto 模式无可用 HTML: {path.name}")
+        return "failed"
+
+    article_id = extract_article_id(raw_path)
+    source_url = guess_source_url(raw_path)
+    article_dir_name = raw_path.parent.name or "unknown"
+    docx_path = docx_path_for_article_html(raw_path)
+
+    def _iter_auto_doc_candidates(base: Path) -> list[Path]:
+        return [base.with_suffix(ext) for ext in (".docx", ".doc", ".pdf", ".ppt", ".pptx", ".bin")]
+
+    try:
+        text = _decode_html_bytes(src_html.read_bytes())
+        soup = BeautifulSoup(text, "html.parser")
+        title, author, publish_date = extract_article_meta(soup)
+        article_title = title or raw_path.stem
+        content = resolve_content_node(
+            soup=soup,
+            raw_html=text,
+            session=session,
+            source_url=source_url,
+            article_id=article_id,
+            article_title=article_title,
+            article_dir_name=article_dir_name,
+        )
+        if content is None:
+            raise ValueError("未找到正文容器")
+
+        if _is_preview_content_node(content):
+            out_base = clean_path.with_suffix("")
+            preview_targets = _iter_auto_doc_candidates(out_base)
+            if force_docx:
+                for fp in preview_targets:
+                    if fp.is_file():
+                        fp.unlink(missing_ok=True)
+            else:
+                for fp in preview_targets:
+                    if fp.is_file():
+                        log_info(f"auto 预览文档已存在，跳过下载: {fp.name}")
+                        return "processed"
+            saved = download_original_preview_document(
+                session,
+                article_id=article_id,
+                source_url=source_url,
+                output_base_path=out_base,
+            )
+            if saved is None:
+                return "failed"
+            log_info(f"[原文档] {saved}")
+            return "processed"
+
+        # 自动流程：先产出 clean HTML。
+        did_clean = False
+        if force_clean:
+            _remove_clean_outputs(clean_path)
+        elif clean_path.is_file():
+            log_info(f"auto clean 已存在，跳过: {clean_path.name}")
+        if not clean_path.is_file():
+            clean_soup = build_clean_soup(title, author, publish_date, content)
+            rs = localize_resources(
+                clean_soup,
+                source_url,
+                clean_path,
+                session,
+                article_id=article_id,
+                article_title=article_title,
+                article_dir_name=article_dir_name,
+            )
+            if rs.failed_urls:
+                append_clean_article_error_line(
+                    f"{article_id}\tarticle={article_title}\tdir={article_dir_name}"
+                    f"\tresource_failed={len(rs.failed_urls)}"
+                )
+            stripped = strip_external_links_in_clean_html(clean_soup)
+            if stripped > 0:
+                log_info(f"清洗外链净化: {clean_path.name} removed={stripped}")
+            clean_path.write_text(str(clean_soup), encoding="utf-8")
+            did_clean = True
+            log_info(f"auto 已清洗: {raw_path.name} -> {clean_path.name}")
+
+        # 自动流程：再转换为 docx。
+        if force_docx and docx_path.is_file():
+            docx_path.unlink(missing_ok=True)
+        elif docx_path.is_file():
+            log_info(f"auto Word 已存在，跳过: {docx_path.name}")
+            return "processed"
+
+        if convert_clean_html_file_to_docx(clean_path, docx_path, force=False):
+            log_info(f"[docx] {docx_path}")
+            return "processed"
+        if did_clean:
+            log_warn(f"auto Word 生成失败: {docx_path.name}")
+        return "failed"
+    except CleanRateLimitError:
+        raise
+    except Exception as exc:
+        log_warn(f"auto 流水线失败 {path.name}: {exc}")
+        append_clean_article_error_line(
+            f"{article_id}\tarticle={raw_path.stem}\tdir={article_dir_name}"
+            f"\tstatus=clean_failed\terr={exc}"
+        )
+        return "failed"
+
+
 def docx_from_raw_html_via_temp(
     path: Path,
     session: requests.Session,
@@ -4364,7 +4485,7 @@ def docx_from_raw_html_via_temp(
     force_docx: bool,
     remove_original: bool = False,
 ) -> str:
-    # Word-only path: clean in temp dir without writing clean_ HTML to output tree.
+    # Word-only 流程：在临时目录清洗，不向输出目录落盘 clean HTML。
     docx_path = docx_path_for_article_html(path)
     if docx_path.exists() and not force_docx:
         return "skipped"

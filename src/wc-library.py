@@ -553,7 +553,6 @@ def fetch_showweb_article_stream(session: requests.Session, art_url: str) -> Res
                 deduplicate=False,
             )
             log_error(f"检测到 403 IP 拦截，停止抓取直接退出。URL: {art_url}")
-            import sys
             sys.exit(5)
         body_preview = (resp.text or "")[:500]
         send_alert_email(
@@ -789,7 +788,6 @@ def fetch_category_page(session: requests.Session, cat: dict, curnum: int) -> di
     return data
 
 
-# 返回值：True 表示已下载，False 表示跳过。
 def save_article_html(
     session: requests.Session,
     article: dict,
@@ -798,7 +796,8 @@ def save_article_html(
     page_num: int,
     *,
     force_html: bool = False,
-) -> bool:
+) -> tuple[bool, Path | None]:
+    """保存单篇 raw HTML，并返回 `(did_save, raw_html_path)`。"""
     art_id = str(article.get("artid", "")).strip()
     raw_title = str(article.get("arttitle") or art_id or "untitled")
     title = decode_text(raw_title)
@@ -807,21 +806,24 @@ def save_article_html(
         raise ValueError(f"artid 无效（需数字）: {art_id!r}")
     safe_title = trim_name(safe_title, MAX_FILE_STEM)
     file_path = category_dir / f"{art_id}-{safe_title}.html"
+    local_raw_by_id = sorted(
+        p
+        for p in category_dir.glob(f"{art_id}-*.html")
+        if p.is_file() and not p.name.lower().startswith("clean_")
+    )
+    if force_html:
+        for old in local_raw_by_id:
+            old.unlink(missing_ok=True)
     if not force_html:
-        local_raw_by_id = sorted(
-            p
-            for p in category_dir.glob(f"{art_id}-*.html")
-            if p.is_file() and not p.name.lower().startswith("clean_")
-        )
         if local_raw_by_id:
             log_info(f"cat={category_id} page={page_num} skip={local_raw_by_id[0].name}")
-            return False
+            return False, local_raw_by_id[0]
         local_clean_by_id = sorted(
             p for p in category_dir.glob(f"clean_{art_id}-*.html") if p.is_file()
         )
         if local_clean_by_id:
             log_info(f"cat={category_id} page={page_num} skip={local_clean_by_id[0].name}")
-            return False
+            return False, None
 
     art_url = showweb_article_url(art_id)
     try:
@@ -833,7 +835,7 @@ def save_article_html(
         log_warn(
             f"cat={category_id} page={page_num} not_found={art_id}-{safe_title}.html"
         )
-        return False
+        return False, None
     html_bytes = html_resp.content
 
     encoding = html_resp.encoding or "utf-8"
@@ -844,8 +846,7 @@ def save_article_html(
 
     file_path.write_text(text_content, encoding="utf-8")
     log_info(f"cat={category_id} page={page_num} saved={file_path.name}")
-    # 下载成功，返回 True。
-    return True
+    return True, file_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -923,6 +924,15 @@ def parse_args() -> argparse.Namespace:
         dest="r_clean_only",
         action="store_true",
         help="仅保留 .docx：删除 raw、clean_ HTML 与本地媒体目录（需同时使用 -w）。",
+    )
+    parser.add_argument(
+        "--auto",
+        dest="auto_mode",
+        action="store_true",
+        help=(
+            "自动流水线模式：每篇原始 HTML 落盘后立即清洗并生成 Word；"
+            "纯文档预览文章直接下载原文档。启用后忽略 -w/-c/--word-only/--clean-only/--r/--r-c。"
+        ),
     )
     parser.add_argument(
         "--start-c",
@@ -1040,6 +1050,8 @@ def _log_startup_library_config(
             log_info("模式: 仅本地处理（--local-only），不登录、不抓取")
     else:
         log_info("模式: 登录并抓取文库文章 HTML")
+        if args.auto_mode:
+            log_info("自动流水线 (--auto): 是（每篇抓取后立即清洗+Word，纯文档直下载）")
     if args.work_dir:
         log_info(f"输出根目录: {root.resolve()}（由 -d / --d 指定）")
     else:
@@ -1098,6 +1110,15 @@ def run() -> None:
     global _LIB_PACING_SEC
 
     args = parse_args()
+    if args.auto_mode:
+        if args.word_only or args.clean_only or args.do_clean or args.gen_word or args.remove_original or args.r_clean_only:
+            log_warn("启用 --auto：已忽略 -w/-c/--word-only/--clean-only/--r/--r-c。")
+        args.word_only = False
+        args.clean_only = False
+        args.do_clean = False
+        args.gen_word = False
+        args.remove_original = False
+        args.r_clean_only = False
     if args.word_only:
         args.gen_word = True
         args.do_clean = False
@@ -1105,6 +1126,9 @@ def run() -> None:
         args.do_clean = True
     if args.r_clean_only:
         args.gen_word = True
+    if args.auto_mode and args.local_only:
+        log_warn("启用 --auto：已忽略 --local-only（自动流水线需要在线抓取）。")
+        args.local_only = False
     local_only_mode = bool(args.local_only or args.word_only or args.clean_only)
 
     clean_disk = bool(args.do_clean and not args.r_clean_only)
@@ -1330,7 +1354,7 @@ def run() -> None:
 
                 for art in artlists:
                     try:
-                        did_fetch = save_article_html(
+                        _, raw_html_path = save_article_html(
                             session,
                             art,
                             category_dir,
@@ -1351,8 +1375,16 @@ def run() -> None:
                         log_warn(f"文章失败 cat={cid} page={page} art={art_id} err={exc}")
                         _lib_request_pacing_sleep()
                     else:
-                        if did_fetch:
-                            _lib_request_pacing_sleep()
+                        if args.auto_mode and raw_html_path is not None:
+                            st = proc.process_one_article_auto(
+                                raw_html_path,
+                                session,
+                                force_clean=args.force,
+                                force_docx=args.force,
+                            )
+                            if st == "failed":
+                                log_warn(f"auto 流水线处理失败: {raw_html_path.name}")
+                        _lib_request_pacing_sleep()
 
                 if len(artlists) < page_size:
                     break
@@ -1360,7 +1392,7 @@ def run() -> None:
                 _lib_request_pacing_sleep()
 
         gen_word_effective = bool(args.gen_word or args.r_clean_only)
-        if clean_disk or gen_word_effective:
+        if (not args.auto_mode) and (clean_disk or gen_word_effective):
             try:
                 proc.run_clean_and_word_pass(
                     root,
