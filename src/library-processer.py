@@ -305,6 +305,21 @@ def _looks_like_expired_signature_body(text: str) -> bool:
     )
 
 
+def _looks_like_signature_mismatch_body(text: str) -> bool:
+    body = (text or "").lower()
+    if not body:
+        return False
+    return (
+        ("signaturedoesnotmatch" in body)
+        or ("request signature we calculated does not match" in body)
+        or (
+            ("<code>accessdenied</code>" in body)
+            and ("signature" in body)
+            and ("does not match" in body)
+        )
+    )
+
+
 def _text_decode_quality_score(text: str) -> int:
     if not text:
         return -10_000
@@ -660,6 +675,10 @@ def request_with_retry(
                 resp = requests.get(url, **req_kwargs)
             if resp.status_code == 403 and _looks_like_expired_signature_body(resp.text):
                 raise ResourceExpiredError(f"resource signature expired url={url}")
+            if resp.status_code == 403 and _looks_like_signature_mismatch_body(resp.text):
+                raise ResourceNotFoundError(
+                    f"resource signature mismatch treated as not_found url={url}"
+                )
             resp_ct = resp.headers.get("content-type", "")
             if resp.status_code == 404 or (
                 resp.status_code < 500
